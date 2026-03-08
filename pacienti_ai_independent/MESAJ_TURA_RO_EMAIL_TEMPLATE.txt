@@ -1,0 +1,31 @@
+Subiect:
+Pacienti AI – update operational Dashboard/Watchlist (02.03.2026)
+
+Buna ziua,
+
+Am publicat un update operational pentru aplicatia Pacienti AI, cu impact direct in fluxul de tura:
+
+1) Dashboard
+- filtrele (sectie + data operationala) se pastreaza intre sesiuni;
+- reset rapid disponibil: „Reset filtre” si „Reset dashboard+istoric”.
+
+2) Istoric Watchlist
+- export CSV/PDF;
+- „Export rapid CSV+PDF” cu feedback clar la final.
+
+3) Stabilitate operare
+- protectie anti dublu-click (debounce) pe refresh/export/import setari;
+- mai putine actiuni duplicate accidentale in utilizarea curenta.
+
+4) Pentru admin (optional)
+- debounce configurabil din Setari;
+- preseturi: Conservator / Echilibrat / Rapid.
+
+Recomandare: nu este necesara actiune imediata pentru utilizatorii de tura; functionalitatile sunt active implicit.
+
+Detalii:
+- release complet: RELEASE_NOTES_RO.md
+- varianta scurta: RELEASE_NOTES_RO_SHORT.md
+
+Multumesc,
+[Semnatura]

@@ -1,0 +1,10 @@
+Update Pacienti AI (02.03.2026) – pe scurt:
+
+• Dashboard-ul retine acum automat filtrele (sectie + data operationala).
+• Avem reset rapid: „Reset filtre” si „Reset dashboard+istoric”.
+• Istoric Watchlist: export CSV/PDF + „Export rapid CSV+PDF”.
+• S-a adaugat protectie anti dublu-click (debounce) pe refresh/export/import setari.
+• Rezultat: mai putine actiuni duplicate si flux mai stabil in tura.
+
+Pentru admin (optional): in Setari exista debounce configurabil + preseturi Conservator/Echilibrat/Rapid.
+Detalii complete: RELEASE_NOTES_RO.md

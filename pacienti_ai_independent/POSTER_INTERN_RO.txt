@@ -1,0 +1,21 @@
+PACIENTI AI – UPDATE OPERATIONAL (02.03.2026)
+
+1) Dashboard mai stabil
+- Filtrele (sectie + data) se pastreaza intre sesiuni.
+- Reset rapid: „Reset filtre” / „Reset dashboard+istoric”.
+
+2) Watchlist mai eficient
+- Istoric Watchlist cu export CSV/PDF.
+- Export rapid CSV+PDF pentru flux de tura.
+
+3) Mai putine click-uri duplicate
+- Protectie anti dublu-click (debounce) pe refresh/export/import setari.
+- Feedback clar cu timpul ramas pana la urmatoarea actiune permisa.
+
+4) Control admin simplu
+- Debounce configurabil din Setari.
+- Preseturi: Conservator / Echilibrat / Rapid.
+
+Detalii complete:
+- RELEASE_NOTES_RO.md
+- RELEASE_NOTES_RO_SHORT.md

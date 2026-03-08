@@ -1,0 +1,5 @@
+Subiect email:
+Pacienti AI – update rapid Dashboard/Watchlist (02.03.2026)
+
+Preview (2-3 randuri):
+Am publicat un update operational: filtrele Dashboard se pastreaza intre sesiuni, exista reset rapid si export rapid pentru Istoric Watchlist. In plus, am adaugat protectie anti dublu-click pe refresh/export/import setari, pentru mai putine actiuni duplicate in tura.

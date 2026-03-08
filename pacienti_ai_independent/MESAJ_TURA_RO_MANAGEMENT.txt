@@ -1,0 +1,8 @@
+Subiect:
+Pacienti AI – update operational (risc redus, beneficii imediate)
+
+Text scurt (management):
+Am livrat un update operational pentru Pacienti AI, fara impact negativ pe fluxurile existente si fara pasi obligatorii pentru utilizatori.
+Beneficii imediate: mai putine actiuni duplicate (anti dublu-click), Dashboard mai stabil (filtre persistente), export rapid pentru Istoric Watchlist.
+Pentru admin, setarile debounce sunt configurabile cu preseturi (Conservator/Echilibrat/Rapid).
+Validare tehnica: compilare + smoke test trecute, fara regresii functionale observate.
