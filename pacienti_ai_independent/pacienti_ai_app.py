@@ -36,6 +36,23 @@ try:
     from pacienti_ai_independent.integrations.siui_drg_client import SiuiDrgClient
     from pacienti_ai_independent.data_backend import PostgresShadowBackend, process_shadow_sync_with_backend
     from pacienti_ai_independent.api.client import EnterpriseApiClient
+    from pacienti_ai_independent.ui_v2 import (
+        ActionBarV2,
+        CommandPalette,
+        FeedbackCenter,
+        SectionCard,
+        ShellV2,
+        UI_V2_TAB_DEFAULTS,
+        UIv2ThemeManager,
+        normalize_ui_v2_chrome_mode,
+        normalize_ui_v2_density,
+        normalize_ui_v2_layout_profile,
+        normalize_ui_v2_motion_profile,
+        normalize_ui_v2_scale_percent,
+        normalize_ui_v2_theme,
+        normalize_ui_v2_visual_style,
+        parse_ui_v2_tab_flags,
+    )
     from pacienti_ai_independent.observability import (
         configure_telemetry,
         elapsed_ms,
@@ -50,6 +67,23 @@ except Exception:
     from integrations.siui_drg_client import SiuiDrgClient
     from data_backend import PostgresShadowBackend, process_shadow_sync_with_backend  # type: ignore[import-not-found]
     from api.client import EnterpriseApiClient  # type: ignore[import-not-found]
+    from ui_v2 import (  # type: ignore[import-not-found]
+        ActionBarV2,
+        CommandPalette,
+        FeedbackCenter,
+        SectionCard,
+        ShellV2,
+        UI_V2_TAB_DEFAULTS,
+        UIv2ThemeManager,
+        normalize_ui_v2_chrome_mode,
+        normalize_ui_v2_density,
+        normalize_ui_v2_layout_profile,
+        normalize_ui_v2_motion_profile,
+        normalize_ui_v2_scale_percent,
+        normalize_ui_v2_theme,
+        normalize_ui_v2_visual_style,
+        parse_ui_v2_tab_flags,
+    )
     from observability import (  # type: ignore[import-not-found]
         configure_telemetry,
         elapsed_ms,
@@ -90,6 +124,8 @@ DEFAULT_AI_PROFILE_PRESETS = (
     "Externare|gpt-5|0.2;"
     "Explica alerta|gpt-5|0.2"
 )
+
+ActionDescriptor = Dict[str, Any]
 
 DEBOUNCE_PRESETS: Dict[str, Tuple[float, float, float]] = {
     "Conservator": (1.4, 1.6, 2.0),
@@ -1699,6 +1735,16 @@ def _attempt_missing_column_self_heal(db_path: Path, error: Exception) -> bool:
         "free_diagnosis_text": [
             ("patients", "ALTER TABLE patients ADD COLUMN free_diagnosis_text TEXT NOT NULL DEFAULT ''"),
         ],
+        "updated_at": [
+            ("admissions", "ALTER TABLE admissions ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''"),
+            ("orders_medical", "ALTER TABLE orders_medical ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''"),
+        ],
+        "row_version": [
+            ("patients", "ALTER TABLE patients ADD COLUMN row_version INTEGER NOT NULL DEFAULT 1"),
+            ("admissions", "ALTER TABLE admissions ADD COLUMN row_version INTEGER NOT NULL DEFAULT 1"),
+            ("orders_medical", "ALTER TABLE orders_medical ADD COLUMN row_version INTEGER NOT NULL DEFAULT 1"),
+            ("case_invoices", "ALTER TABLE case_invoices ADD COLUMN row_version INTEGER NOT NULL DEFAULT 1"),
+        ],
     }
     operations = known_columns.get(missing_col) or []
     if not operations:
@@ -1775,7 +1821,8 @@ class Database:
                     family_history TEXT NOT NULL DEFAULT '',
                     lifestyle_notes TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    row_version INTEGER NOT NULL DEFAULT 1
                 );
 
                 CREATE TABLE IF NOT EXISTS visits (
@@ -1822,7 +1869,9 @@ class Database:
                     admitted_at TEXT NOT NULL,
                     discharged_at TEXT NOT NULL DEFAULT '',
                     discharge_summary TEXT NOT NULL DEFAULT '',
-                    created_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL
+                    created_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                    updated_at TEXT NOT NULL DEFAULT '',
+                    row_version INTEGER NOT NULL DEFAULT 1
                 );
 
                 CREATE TABLE IF NOT EXISTS orders_medical (
@@ -1835,7 +1884,9 @@ class Database:
                     status TEXT NOT NULL DEFAULT 'ordered',
                     ordered_at TEXT NOT NULL,
                     completed_at TEXT NOT NULL DEFAULT '',
-                    ordered_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL
+                    ordered_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                    updated_at TEXT NOT NULL DEFAULT '',
+                    row_version INTEGER NOT NULL DEFAULT 1
                 );
 
                 CREATE TABLE IF NOT EXISTS vitals (
@@ -2094,7 +2145,8 @@ class Database:
                     notes TEXT NOT NULL DEFAULT '',
                     created_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
                     created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    row_version INTEGER NOT NULL DEFAULT 1
                 );
 
                 CREATE TABLE IF NOT EXISTS invoice_payments (
@@ -2410,6 +2462,7 @@ class Database:
             self._ensure_admission_diagnoses_columns(conn)
             self._ensure_integration_columns(conn)
             self._ensure_manual1_columns(conn)
+            self._ensure_concurrency_columns(conn)
             self._ensure_integration_indexes(conn)
             self._ensure_manual1_indexes(conn)
             self._ensure_default_users(conn)
@@ -2524,6 +2577,42 @@ class Database:
             }
             if "series_rule_id" not in cols:
                 conn.execute("ALTER TABLE medical_leaves ADD COLUMN series_rule_id INTEGER")
+
+    def _ensure_concurrency_columns(self, conn: sqlite3.Connection) -> None:
+        existing_tables = {
+            str(row[0]).strip().lower()
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        }
+
+        if "patients" in existing_tables:
+            cols = {str(row[1]).strip().lower() for row in conn.execute("PRAGMA table_info(patients)").fetchall()}
+            if "row_version" not in cols:
+                conn.execute("ALTER TABLE patients ADD COLUMN row_version INTEGER NOT NULL DEFAULT 1")
+            conn.execute("UPDATE patients SET row_version = 1 WHERE row_version IS NULL OR row_version <= 0")
+
+        if "admissions" in existing_tables:
+            cols = {str(row[1]).strip().lower() for row in conn.execute("PRAGMA table_info(admissions)").fetchall()}
+            if "updated_at" not in cols:
+                conn.execute("ALTER TABLE admissions ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''")
+            if "row_version" not in cols:
+                conn.execute("ALTER TABLE admissions ADD COLUMN row_version INTEGER NOT NULL DEFAULT 1")
+            conn.execute("UPDATE admissions SET updated_at = admitted_at WHERE updated_at = ''")
+            conn.execute("UPDATE admissions SET row_version = 1 WHERE row_version IS NULL OR row_version <= 0")
+
+        if "orders_medical" in existing_tables:
+            cols = {str(row[1]).strip().lower() for row in conn.execute("PRAGMA table_info(orders_medical)").fetchall()}
+            if "updated_at" not in cols:
+                conn.execute("ALTER TABLE orders_medical ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''")
+            if "row_version" not in cols:
+                conn.execute("ALTER TABLE orders_medical ADD COLUMN row_version INTEGER NOT NULL DEFAULT 1")
+            conn.execute("UPDATE orders_medical SET updated_at = ordered_at WHERE updated_at = ''")
+            conn.execute("UPDATE orders_medical SET row_version = 1 WHERE row_version IS NULL OR row_version <= 0")
+
+        if "case_invoices" in existing_tables:
+            cols = {str(row[1]).strip().lower() for row in conn.execute("PRAGMA table_info(case_invoices)").fetchall()}
+            if "row_version" not in cols:
+                conn.execute("ALTER TABLE case_invoices ADD COLUMN row_version INTEGER NOT NULL DEFAULT 1")
+            conn.execute("UPDATE case_invoices SET row_version = 1 WHERE row_version IS NULL OR row_version <= 0")
 
     def _ensure_manual1_indexes(self, conn: sqlite3.Connection) -> None:
         statements = (
@@ -3026,6 +3115,77 @@ class Database:
         for row in rows:
             out[str(row["key"])] = str(row["value"] or "")
         return out
+
+    def record_station_heartbeat(
+        self,
+        *,
+        user_id: int,
+        user_role: str,
+        client_name: str,
+        ip_address: str,
+        user_agent: str,
+    ) -> int:
+        uid = int(user_id or 0)
+        if uid <= 0:
+            raise ValueError("user_id heartbeat invalid.")
+        client = (client_name or "").strip() or "desktop"
+        role = (user_role or "").strip().lower() or "unknown"
+        ip = (ip_address or "").strip()
+        ua = (user_agent or "").strip()
+        token_hash = hashlib.sha256(f"{uid}|{role}|{client}|{ip}".encode("utf-8")).hexdigest()
+        ts = now_ts()
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO user_sessions (
+                    user_id, session_token_hash, user_role, client_name, ip_address, user_agent,
+                    issued_at, expires_at, revoked_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, '', '')
+                """,
+                (
+                    uid,
+                    token_hash,
+                    role,
+                    client,
+                    ip,
+                    ua,
+                    ts,
+                ),
+            )
+            conn.commit()
+            return int(cur.lastrowid)
+
+    def list_station_heartbeats(self, *, limit: int = 200, minutes: int = 15) -> List[sqlite3.Row]:
+        lim = max(1, int(limit or 200))
+        mins = max(1, int(minutes or 15))
+        cutoff = (datetime.now() - timedelta(minutes=mins)).strftime("%Y-%m-%d %H:%M:%S")
+        with self._connect() as conn:
+            return conn.execute(
+                """
+                SELECT
+                    s.client_name,
+                    s.ip_address,
+                    s.user_role,
+                    s.user_id,
+                    COALESCE(u.display_name, u.username, '') AS actor_name,
+                    MAX(s.issued_at) AS last_seen_at,
+                    'online' AS status
+                FROM user_sessions s
+                LEFT JOIN users u ON u.id = s.user_id
+                WHERE s.revoked_at = ''
+                  AND s.issued_at >= ?
+                GROUP BY
+                    s.session_token_hash,
+                    s.client_name,
+                    s.ip_address,
+                    s.user_role,
+                    s.user_id,
+                    COALESCE(u.display_name, u.username, '')
+                ORDER BY MAX(s.issued_at) DESC
+                LIMIT ?
+                """,
+                (cutoff, lim),
+            ).fetchall()
 
     def replace_street_catalog(self, rows: List[Dict[str, Any]]) -> int:
         prepared: List[Tuple[str, str, str, str, str, str, str]] = []
@@ -4915,19 +5075,23 @@ class Database:
                     conn.execute(
                         """
                         UPDATE orders_medical
-                        SET status = 'in_progress'
+                        SET status = 'in_progress',
+                            updated_at = ?,
+                            row_version = row_version + 1
                         WHERE id = ? AND status IN ('ordered', 'in_progress')
                         """,
-                        (order_id,),
+                        (now_ts(), order_id),
                     )
                 elif state == "send_failed":
                     conn.execute(
                         """
                         UPDATE orders_medical
-                        SET status = 'ordered', completed_at = ''
+                        SET status = 'ordered', completed_at = '',
+                            updated_at = ?,
+                            row_version = row_version + 1
                         WHERE id = ? AND status = 'in_progress'
                         """,
-                        (order_id,),
+                        (now_ts(), order_id),
                     )
             conn.commit()
 
@@ -4979,10 +5143,12 @@ class Database:
                 conn.execute(
                     """
                     UPDATE orders_medical
-                    SET status = 'in_progress'
+                    SET status = 'in_progress',
+                        updated_at = ?,
+                        row_version = row_version + 1
                     WHERE id = ? AND status IN ('ordered', 'in_progress')
                     """,
-                    (order_id,),
+                    (now_ts(), order_id),
                 )
             conn.commit()
 
@@ -5681,8 +5847,8 @@ class Database:
                     gender, occupation, insurance_provider, insurance_id,
                     emergency_contact_name, emergency_contact_phone, blood_type,
                     height_cm, weight_kg, surgeries, family_history, lifestyle_notes,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    created_at, updated_at, row_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     payload["first_name"],
@@ -5713,15 +5879,21 @@ class Database:
                     payload["lifestyle_notes"],
                     ts,
                     ts,
+                    1,
                 ),
             )
             conn.commit()
             return int(cur.lastrowid)
 
-    def update_patient(self, patient_id: int, payload: Dict[str, str]) -> None:
+    def update_patient(
+        self,
+        patient_id: int,
+        payload: Dict[str, str],
+        *,
+        expected_row_version: Optional[int] = None,
+    ) -> None:
         with self._connect() as conn:
-            conn.execute(
-                """
+            sql = """
                 UPDATE patients
                 SET first_name = ?,
                     last_name = ?,
@@ -5749,40 +5921,56 @@ class Database:
                     surgeries = ?,
                     family_history = ?,
                     lifestyle_notes = ?,
-                    updated_at = ?
+                    updated_at = ?,
+                    row_version = row_version + 1
                 WHERE id = ?
-                """,
-                (
-                    payload["first_name"],
-                    payload["last_name"],
-                    payload["cnp"],
-                    payload["phone"],
-                    payload["email"],
-                    payload["birth_date"],
-                    payload["address"],
-                    payload["medical_history"],
-                    payload["allergies"],
-                    payload["chronic_conditions"],
-                    payload["current_medication"],
-                    _normalize_icd10_code(payload.get("primary_diagnosis_icd10", "")),
-                    _serialize_icd10_codes_csv(_parse_icd10_codes_csv(payload.get("secondary_diagnoses_icd10", ""))),
-                    (payload.get("free_diagnosis_text") or "").strip(),
-                    payload["gender"],
-                    payload["occupation"],
-                    payload["insurance_provider"],
-                    payload["insurance_id"],
-                    payload["emergency_contact_name"],
-                    payload["emergency_contact_phone"],
-                    payload["blood_type"],
-                    payload["height_cm"],
-                    payload["weight_kg"],
-                    payload["surgeries"],
-                    payload["family_history"],
-                    payload["lifestyle_notes"],
-                    now_ts(),
-                    patient_id,
-                ),
-            )
+            """
+            params: List[Any] = [
+                payload["first_name"],
+                payload["last_name"],
+                payload["cnp"],
+                payload["phone"],
+                payload["email"],
+                payload["birth_date"],
+                payload["address"],
+                payload["medical_history"],
+                payload["allergies"],
+                payload["chronic_conditions"],
+                payload["current_medication"],
+                _normalize_icd10_code(payload.get("primary_diagnosis_icd10", "")),
+                _serialize_icd10_codes_csv(_parse_icd10_codes_csv(payload.get("secondary_diagnoses_icd10", ""))),
+                (payload.get("free_diagnosis_text") or "").strip(),
+                payload["gender"],
+                payload["occupation"],
+                payload["insurance_provider"],
+                payload["insurance_id"],
+                payload["emergency_contact_name"],
+                payload["emergency_contact_phone"],
+                payload["blood_type"],
+                payload["height_cm"],
+                payload["weight_kg"],
+                payload["surgeries"],
+                payload["family_history"],
+                payload["lifestyle_notes"],
+                now_ts(),
+                int(patient_id),
+            ]
+            if expected_row_version is not None:
+                sql += " AND row_version = ?"
+                params.append(int(expected_row_version))
+            cur = conn.execute(sql, params)
+            if int(cur.rowcount or 0) <= 0:
+                current = conn.execute(
+                    "SELECT id, row_version FROM patients WHERE id = ? LIMIT 1",
+                    (int(patient_id),),
+                ).fetchone()
+                if not current:
+                    raise ValueError("Pacient inexistent.")
+                if expected_row_version is not None:
+                    raise ValueError(
+                        "Conflict de concurenta: fisa pacientului a fost modificata intre timp. "
+                        f"row_version curent={int(current['row_version'] or 0)}."
+                    )
             conn.commit()
 
     def delete_patient(self, patient_id: int) -> None:
@@ -6694,8 +6882,9 @@ class Database:
                 """
                 INSERT INTO admissions (
                     patient_id, mrn, admission_type, triage_level, department, ward, bed,
-                    attending_clinician, chief_complaint, status, admitted_at, created_by_user_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
+                    attending_clinician, chief_complaint, status, admitted_at, created_by_user_id,
+                    updated_at, row_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, 1)
                 """,
                 (
                     int(payload["patient_id"]),
@@ -6709,6 +6898,7 @@ class Database:
                     payload["chief_complaint"],
                     payload["admitted_at"],
                     user_id,
+                    payload["admitted_at"],
                 ),
             )
             admission_id = int(cur.lastrowid)
@@ -6753,6 +6943,7 @@ class Database:
                     """
                     SELECT id, mrn, admission_type, triage_level, department, ward, bed,
                            attending_clinician, chief_complaint, status, admitted_at, discharged_at, discharge_summary,
+                           row_version,
                            (SELECT c.finalized_at FROM admission_case_closure c WHERE c.admission_id = admissions.id) AS case_finalized_at
                     FROM admissions
                     WHERE patient_id = ?
@@ -6765,6 +6956,7 @@ class Database:
                 """
                 SELECT id, mrn, admission_type, triage_level, department, ward, bed,
                       attending_clinician, chief_complaint, status, admitted_at, discharged_at, discharge_summary,
+                      row_version,
                       (SELECT c.finalized_at FROM admission_case_closure c WHERE c.admission_id = admissions.id) AS case_finalized_at
                 FROM admissions
                 WHERE patient_id = ? AND status = 'active'
@@ -6779,7 +6971,7 @@ class Database:
             return conn.execute(
                 """
                 SELECT id, mrn, admission_type, triage_level, department, ward, bed,
-                       attending_clinician, chief_complaint, status, admitted_at
+                       attending_clinician, chief_complaint, status, admitted_at, row_version
                 FROM admissions
                 WHERE patient_id = ? AND status = 'active'
                 ORDER BY admitted_at DESC, id DESC
@@ -6788,11 +6980,17 @@ class Database:
                 (patient_id,),
             ).fetchone()
 
-    def discharge_admission(self, admission_id: int, discharge_summary: str) -> Optional[int]:
+    def discharge_admission(
+        self,
+        admission_id: int,
+        discharge_summary: str,
+        *,
+        expected_row_version: Optional[int] = None,
+    ) -> Optional[int]:
         with self._connect() as conn:
             row = conn.execute(
                 """
-                SELECT patient_id, department, ward, bed, status
+                SELECT patient_id, department, ward, bed, status, row_version
                 FROM admissions
                 WHERE id = ?
                 """,
@@ -6819,16 +7017,31 @@ class Database:
                     "Tranzitie invalida: pacientul trebuie sa aiba programare de externare in ziua curenta. "
                     "Programeaza externarea inainte de finalizare."
                 )
-            conn.execute(
-                """
+            sql = """
                 UPDATE admissions
                 SET status = 'discharged',
                     discharged_at = ?,
-                    discharge_summary = ?
+                    discharge_summary = ?,
+                    updated_at = ?,
+                    row_version = row_version + 1
                 WHERE id = ? AND status = 'active'
-                """,
-                (when, discharge_summary.strip(), admission_id),
-            )
+            """
+            params: List[Any] = [when, discharge_summary.strip(), when, int(admission_id)]
+            if expected_row_version is not None:
+                sql += " AND row_version = ?"
+                params.append(int(expected_row_version))
+            cur = conn.execute(sql, params)
+            if int(cur.rowcount or 0) <= 0:
+                current = conn.execute(
+                    "SELECT status, row_version FROM admissions WHERE id = ? LIMIT 1",
+                    (int(admission_id),),
+                ).fetchone()
+                if not current or str(current["status"] or "").strip().lower() != "active":
+                    raise ValueError("Internarea selectata nu este activa.")
+                raise ValueError(
+                    "Conflict de concurenta: internarea a fost modificata intre timp. "
+                    f"row_version curent={int(current['row_version'] or 0)}."
+                )
             conn.execute(
                 """
                 UPDATE care_bookings
@@ -6885,13 +7098,14 @@ class Database:
         transferred_at: str,
         notes: str,
         user_id: Optional[int],
+        expected_row_version: Optional[int] = None,
     ) -> None:
         when = (transferred_at or "").strip() or now_ts()
         self._parse_dt_text(when)
         with self._connect() as conn:
             row = conn.execute(
                 """
-                SELECT id, status, department, ward, bed, admitted_at
+                SELECT id, status, department, ward, bed, admitted_at, row_version
                 FROM admissions
                 WHERE id = ?
                 """,
@@ -6922,14 +7136,28 @@ class Database:
             if self.has_active_bed_conflict(dept_new, ward_new, bed_new, exclude_admission_id=admission_id):
                 raise ValueError("Patul tinta este ocupat de o alta internare activa.")
 
-            conn.execute(
-                """
+            sql = """
                 UPDATE admissions
-                SET department = ?, ward = ?, bed = ?
+                SET department = ?, ward = ?, bed = ?,
+                    updated_at = ?, row_version = row_version + 1
                 WHERE id = ?
-                """,
-                (dept_new, ward_new, bed_new, admission_id),
-            )
+            """
+            params: List[Any] = [dept_new, ward_new, bed_new, when, int(admission_id)]
+            if expected_row_version is not None:
+                sql += " AND row_version = ?"
+                params.append(int(expected_row_version))
+            cur = conn.execute(sql, params)
+            if int(cur.rowcount or 0) <= 0:
+                current = conn.execute(
+                    "SELECT status, row_version FROM admissions WHERE id = ? LIMIT 1",
+                    (int(admission_id),),
+                ).fetchone()
+                if not current or str(current["status"] or "").strip().lower() != "active":
+                    raise ValueError("Internarea selectata nu este activa.")
+                raise ValueError(
+                    "Conflict de concurenta: internarea a fost modificata intre timp. "
+                    f"row_version curent={int(current['row_version'] or 0)}."
+                )
             conn.execute(
                 """
                 INSERT INTO admission_transfers (
@@ -7875,7 +8103,7 @@ class Database:
                 """
                 SELECT id, patient_id, admission_id, invoice_type, series, invoice_number,
                        subtotal, tax_amount, total_amount, currency, issued_at, due_date,
-                       partner_id, cost_center_id, status, notes, created_at, updated_at
+                       partner_id, cost_center_id, status, notes, created_at, updated_at, row_version
                 FROM case_invoices
                 WHERE admission_id = ?
                 ORDER BY issued_at DESC, id DESC
@@ -8016,14 +8244,20 @@ class Database:
         out_path.write_text("\n".join(lines), encoding="utf-8")
         return out_path
 
-    def update_case_invoice_status(self, invoice_id: int, status: str) -> None:
+    def update_case_invoice_status(
+        self,
+        invoice_id: int,
+        status: str,
+        *,
+        expected_row_version: Optional[int] = None,
+    ) -> None:
         state = (status or "").strip().lower()
         if state not in {"draft", "issued", "paid", "cancelled"}:
             raise ValueError("Status factura invalid.")
         with self._connect() as conn:
             row = conn.execute(
                 """
-                SELECT id, total_amount
+                SELECT id, total_amount, row_version
                 FROM case_invoices
                 WHERE id = ?
                 LIMIT 1
@@ -8045,14 +8279,27 @@ class Database:
                 total_amount = float(row["total_amount"] or 0.0)
                 if total_amount > 0 and paid_total + 0.01 < total_amount:
                     raise ValueError("Factura nu este acoperita integral de plati.")
-            conn.execute(
-                """
+            sql = """
                 UPDATE case_invoices
-                SET status = ?, updated_at = ?
+                SET status = ?, updated_at = ?, row_version = row_version + 1
                 WHERE id = ?
-                """,
-                (state, now_ts(), invoice_id),
-            )
+            """
+            params: List[Any] = [state, now_ts(), int(invoice_id)]
+            if expected_row_version is not None:
+                sql += " AND row_version = ?"
+                params.append(int(expected_row_version))
+            cur = conn.execute(sql, params)
+            if int(cur.rowcount or 0) <= 0:
+                current = conn.execute(
+                    "SELECT id, row_version FROM case_invoices WHERE id = ? LIMIT 1",
+                    (int(invoice_id),),
+                ).fetchone()
+                if not current:
+                    raise ValueError("Factura inexistenta.")
+                raise ValueError(
+                    "Conflict de concurenta: factura a fost modificata intre timp. "
+                    f"row_version curent={int(current['row_version'] or 0)}."
+                )
             conn.commit()
 
     def register_invoice_payment(
@@ -8128,7 +8375,7 @@ class Database:
             conn.execute(
                 """
                 UPDATE case_invoices
-                SET status = ?, updated_at = ?
+                SET status = ?, updated_at = ?, row_version = row_version + 1
                 WHERE id = ?
                 """,
                 (new_status, now_ts(), invoice_id),
@@ -8265,8 +8512,14 @@ class Database:
             )
             if init_status == "sent" and (order["status"] or "").strip().lower() == "ordered":
                 conn.execute(
-                    "UPDATE orders_medical SET status = 'in_progress' WHERE id = ?",
-                    (order_id,),
+                    """
+                    UPDATE orders_medical
+                    SET status = 'in_progress',
+                        updated_at = ?,
+                        row_version = row_version + 1
+                    WHERE id = ?
+                    """,
+                    (now_ts(), order_id),
                 )
             conn.commit()
             return int(cur.lastrowid)
@@ -8338,10 +8591,12 @@ class Database:
                     conn.execute(
                         """
                         UPDATE orders_medical
-                        SET status = 'done', completed_at = ?
+                        SET status = 'done', completed_at = ?,
+                            updated_at = ?,
+                            row_version = row_version + 1
                         WHERE id = ?
                         """,
-                        (now_ts(), order_id),
+                        (now_ts(), now_ts(), order_id),
                     )
                 elif state in {"cancelled", "rejected"}:
                     order = conn.execute("SELECT status FROM orders_medical WHERE id = ? LIMIT 1", (order_id,)).fetchone()
@@ -8349,10 +8604,12 @@ class Database:
                         conn.execute(
                             """
                             UPDATE orders_medical
-                            SET status = 'cancelled', completed_at = ''
+                            SET status = 'cancelled', completed_at = '',
+                                updated_at = ?,
+                                row_version = row_version + 1
                             WHERE id = ?
                             """,
-                            (order_id,),
+                            (now_ts(), order_id),
                         )
                 elif state == "queued":
                     order = conn.execute("SELECT status FROM orders_medical WHERE id = ? LIMIT 1", (order_id,)).fetchone()
@@ -8360,10 +8617,12 @@ class Database:
                         conn.execute(
                             """
                             UPDATE orders_medical
-                            SET status = 'ordered', completed_at = ''
+                            SET status = 'ordered', completed_at = '',
+                                updated_at = ?,
+                                row_version = row_version + 1
                             WHERE id = ?
                             """,
-                            (order_id,),
+                            (now_ts(), order_id),
                         )
                 elif state == "send_failed":
                     order = conn.execute("SELECT status FROM orders_medical WHERE id = ? LIMIT 1", (order_id,)).fetchone()
@@ -8371,10 +8630,12 @@ class Database:
                         conn.execute(
                             """
                             UPDATE orders_medical
-                            SET status = 'ordered', completed_at = ''
+                            SET status = 'ordered', completed_at = '',
+                                updated_at = ?,
+                                row_version = row_version + 1
                             WHERE id = ?
                             """,
-                            (order_id,),
+                            (now_ts(), order_id),
                         )
             conn.commit()
 
@@ -8730,8 +8991,8 @@ class Database:
                 """
                 INSERT INTO orders_medical (
                     patient_id, admission_id, order_type, priority, order_text,
-                    status, ordered_at, ordered_by_user_id
-                ) VALUES (?, ?, ?, ?, ?, 'ordered', ?, ?)
+                    status, ordered_at, ordered_by_user_id, updated_at, row_version
+                ) VALUES (?, ?, ?, ?, ?, 'ordered', ?, ?, ?, 1)
                 """,
                 (
                     patient_id,
@@ -8741,6 +9002,7 @@ class Database:
                     order_text.strip(),
                     now_ts(),
                     user_id,
+                    now_ts(),
                 ),
             )
             conn.commit()
@@ -8750,7 +9012,7 @@ class Database:
         with self._connect() as conn:
             return conn.execute(
                 """
-                SELECT id, admission_id, order_type, priority, order_text, status, ordered_at, completed_at
+                SELECT id, admission_id, order_type, priority, order_text, status, ordered_at, completed_at, row_version
                 FROM orders_medical
                 WHERE patient_id = ?
                 ORDER BY ordered_at DESC, id DESC
@@ -8763,7 +9025,7 @@ class Database:
         with self._connect() as conn:
             return conn.execute(
                 """
-                SELECT id, patient_id, admission_id, order_type, priority, order_text, status, ordered_at, completed_at
+                SELECT id, patient_id, admission_id, order_type, priority, order_text, status, ordered_at, completed_at, row_version
                 FROM orders_medical
                 WHERE id = ?
                 LIMIT 1
@@ -8771,20 +9033,39 @@ class Database:
                 (int(order_id),),
             ).fetchone()
 
-    def update_order_status(self, order_id: int, new_status: str) -> None:
+    def update_order_status(
+        self,
+        order_id: int,
+        new_status: str,
+        *,
+        expected_row_version: Optional[int] = None,
+    ) -> None:
         status = (new_status or "").strip().lower()
         if status not in {"ordered", "in_progress", "done", "cancelled"}:
             raise ValueError("Status invalid pentru ordin medical.")
         completed_at = now_ts() if status == "done" else ""
         with self._connect() as conn:
-            conn.execute(
-                """
+            sql = """
                 UPDATE orders_medical
-                SET status = ?, completed_at = ?
+                SET status = ?, completed_at = ?, updated_at = ?, row_version = row_version + 1
                 WHERE id = ?
-                """,
-                (status, completed_at, order_id),
-            )
+            """
+            params: List[Any] = [status, completed_at, now_ts(), int(order_id)]
+            if expected_row_version is not None:
+                sql += " AND row_version = ?"
+                params.append(int(expected_row_version))
+            cur = conn.execute(sql, params)
+            if int(cur.rowcount or 0) <= 0:
+                current = conn.execute(
+                    "SELECT id, row_version FROM orders_medical WHERE id = ? LIMIT 1",
+                    (int(order_id),),
+                ).fetchone()
+                if not current:
+                    raise ValueError("Ordin inexistent.")
+                raise ValueError(
+                    "Conflict de concurenta: ordinul a fost modificat intre timp. "
+                    f"row_version curent={int(current['row_version'] or 0)}."
+                )
             conn.commit()
 
     def add_vital(self, patient_id: int, admission_id: Optional[int], payload: Dict[str, str], user_id: Optional[int]) -> int:
@@ -9428,7 +9709,7 @@ class Database:
             return conn.execute(
                 """
                 SELECT a.id, a.patient_id, a.mrn, a.admission_type, a.triage_level, a.department, a.ward, a.bed,
-                       a.attending_clinician, a.chief_complaint, a.status, a.admitted_at, a.discharged_at, a.discharge_summary,
+                       a.attending_clinician, a.chief_complaint, a.status, a.admitted_at, a.discharged_at, a.discharge_summary, a.row_version,
                        p.first_name, p.last_name, p.cnp, p.birth_date, p.gender, p.phone, p.address, p.insurance_provider, p.insurance_id,
                        c.finalized_at AS case_finalized_at, c.validation_report AS case_validation_report,
                       d.referral_diagnosis, d.admission_diagnosis, d.discharge_diagnosis,
@@ -9446,7 +9727,7 @@ class Database:
         with self._connect() as conn:
             return conn.execute(
                 """
-                SELECT id, order_type, priority, status, ordered_at, completed_at, order_text
+                SELECT id, order_type, priority, status, ordered_at, completed_at, order_text, row_version
                 FROM orders_medical
                 WHERE admission_id = ?
                 ORDER BY ordered_at DESC, id DESC
@@ -9590,6 +9871,15 @@ class Database:
                 """,
                 (patient_id, limit),
             ).fetchall()[::-1]
+
+    def clear_ai_messages(self, patient_id: int) -> int:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM ai_messages WHERE patient_id = ?",
+                (int(patient_id),),
+            )
+            conn.commit()
+            return int(cur.rowcount or 0)
 
 
 class AIService:
@@ -10061,6 +10351,36 @@ class PacientiAIApp:
         self.case_require_siui_drg_submission = False
         self.case_require_financial_closure = False
         self.ui_compact_menus_enabled = True
+        self.ui_v2_enabled = True
+        self.ui_v2_theme = "system"
+        self.ui_v2_density = "comfortable"
+        self.ui_v2_scale_percent = 100
+        self.ui_v2_enable_command_palette = True
+        self.ui_v2_enable_toasts = True
+        self.ui_v2_visual_style = "premium"
+        self.ui_v2_chrome_mode = "modern"
+        self.ui_v2_motion_profile = "max"
+        self.ui_v2_layout_profile = "premium_glass_clinic"
+        self.ui_v2_enable_glass_surface = True
+        self.ui_v2_enable_animations = True
+        self.ui_v2_tab_flags_json = ""
+        self.ui_v2_tab_flags: Dict[str, bool] = {}
+        self.ui_v2_theme_manager: Optional[UIv2ThemeManager] = None
+        self.ui_v2_command_palette: Optional[CommandPalette] = None
+        self.ui_v2_shell: Optional[ShellV2] = None
+        self.ui_v2_feedback_center: Optional[FeedbackCenter] = None
+        self.ui_v2_theme_quick_button: Optional[ttk.Menubutton] = None
+        self.ui_v2_density_quick_button: Optional[ttk.Menubutton] = None
+        self.ui_v2_scale_quick_button: Optional[ttk.Menubutton] = None
+        self.ui_v2_motion_quick_button: Optional[ttk.Menubutton] = None
+        self.ui_v2_palette: Dict[str, Any] = {}
+        self.ui_v2_tab_nav_wrap: Optional[ttk.Frame] = None
+        self._ui_v2_shortcuts_bound = False
+        self._messagebox_showinfo_original: Optional[Callable[..., Any]] = None
+        self._messagebox_showinfo_proxy_installed = False
+        self._toast_job: Optional[str] = None
+        self.toast_status_var: Optional[tk.StringVar] = None
+        self.toast_status_label: Optional[ttk.Label] = None
         self.siui_drg_live_enabled = False
         self.siui_drg_dry_run_enabled = False
         self.siui_drg_base_url = ""
@@ -10113,6 +10433,11 @@ class PacientiAIApp:
         self.api_internal_postgres_shadow_batch_size = 50
         self.api_internal_postgres_shadow_interval_seconds = 60
         self.api_internal_postgres_shadow_stop_on_error_rate = 0.5
+        self.api_internal_db_mode = "sqlite"
+        self.api_internal_postgres_primary_enabled = False
+        self.api_internal_postgres_require_tls = True
+        self.api_internal_offline_sync_enabled = True
+        self.api_internal_offline_sync_batch_size = 100
         self.api_internal_use_for_patient_read = False
         self.api_internal_use_for_diagnosis = True
         self.api_internal_use_for_patient_write = False
@@ -10217,6 +10542,9 @@ class PacientiAIApp:
         self.menu_action_registry: Dict[str, List[Tuple[tk.Menu, int]]] = {}
         self.menu_action_keys_by_label: Dict[str, List[str]] = {}
         self.menu_action_key_counter: Dict[str, int] = {}
+        self.scrollable_tab_registry: Dict[str, Dict[str, Any]] = {}
+        self.scrollable_tab_hovered_id: Optional[str] = None
+        self.overflow_palette_actions: Dict[str, List[Dict[str, Any]]] = {}
         self._patient_form_loading = False
         self.cnp_feedback_var: Optional[tk.StringVar] = None
         self.cnp_feedback_label: Optional[ttk.Label] = None
@@ -10247,6 +10575,7 @@ class PacientiAIApp:
         self.patient_snapshot_diff_box: Optional[ScrolledText] = None
         self.patient_address_catalog: Dict[str, List[str]] = _load_ro_localities_catalog()
         self.patient_address_all_options: Tuple[str, ...] = _flatten_ro_address_options(self.patient_address_catalog)
+        self.search_entry: Optional[ttk.Entry] = None
         self.patient_address_county_var: Optional[tk.StringVar] = None
         self.patient_address_locality_var: Optional[tk.StringVar] = None
         self.patient_address_details_var: Optional[tk.StringVar] = None
@@ -10285,6 +10614,7 @@ class PacientiAIApp:
         self.root.geometry("1320x820")
         self.root.minsize(1120, 700)
 
+        self._init_ui_v2_runtime()
         self._build_ui()
         self._refresh_partner_and_cost_center_reference_data()
         self._schedule_integration_jobs()
@@ -11057,6 +11387,66 @@ class PacientiAIApp:
             0.0,
             1.0,
         )
+        default_db_mode = (
+            "postgres_primary"
+            if self.api_internal_db_backend == "postgres"
+            else ("shadow" if self.api_internal_postgres_shadow_enabled else "sqlite")
+        )
+        self.api_internal_db_mode = (
+            self._setting_raw(
+                "API_INTERNAL_DB_MODE",
+                "API_INTERNAL_DB_MODE",
+                getattr(self, "api_internal_db_mode", default_db_mode),
+            ).strip().lower()
+            or default_db_mode
+        )
+        if self.api_internal_db_mode not in {"sqlite", "shadow", "postgres_primary"}:
+            self.api_internal_db_mode = default_db_mode
+        self.api_internal_postgres_primary_enabled = self._to_bool(
+            self._setting_raw(
+                "API_INTERNAL_POSTGRES_PRIMARY_ENABLED",
+                "API_INTERNAL_POSTGRES_PRIMARY_ENABLED",
+                "1" if getattr(self, "api_internal_postgres_primary_enabled", False) else "0",
+            ),
+            self.api_internal_db_mode == "postgres_primary",
+        )
+        self.api_internal_postgres_require_tls = self._to_bool(
+            self._setting_raw(
+                "API_INTERNAL_POSTGRES_REQUIRE_TLS",
+                "API_INTERNAL_POSTGRES_REQUIRE_TLS",
+                "1" if getattr(self, "api_internal_postgres_require_tls", True) else "0",
+            ),
+            True,
+        )
+        self.api_internal_offline_sync_enabled = self._to_bool(
+            self._setting_raw(
+                "API_INTERNAL_OFFLINE_SYNC_ENABLED",
+                "API_INTERNAL_OFFLINE_SYNC_ENABLED",
+                "1" if getattr(self, "api_internal_offline_sync_enabled", True) else "0",
+            ),
+            True,
+        )
+        self.api_internal_offline_sync_batch_size = self._to_int(
+            self._setting_raw(
+                "API_INTERNAL_OFFLINE_SYNC_BATCH_SIZE",
+                "API_INTERNAL_OFFLINE_SYNC_BATCH_SIZE",
+                str(getattr(self, "api_internal_offline_sync_batch_size", 100)),
+            ),
+            100,
+            1,
+        )
+        if self.api_internal_db_mode == "postgres_primary":
+            self.api_internal_db_backend = "postgres"
+            self.api_internal_postgres_primary_enabled = True
+            self.api_internal_postgres_shadow_enabled = False
+        elif self.api_internal_db_mode == "shadow":
+            self.api_internal_db_backend = "sqlite"
+            self.api_internal_postgres_primary_enabled = False
+            self.api_internal_postgres_shadow_enabled = True
+        else:
+            self.api_internal_db_backend = "sqlite"
+            self.api_internal_postgres_primary_enabled = False
+            self.api_internal_postgres_shadow_enabled = False
         self.api_internal_use_for_patient_read = self._to_bool(
             self._setting_raw(
                 "API_INTERNAL_USE_FOR_PATIENT_READ",
@@ -11174,10 +11564,98 @@ class PacientiAIApp:
             self._setting_raw("WATCHLIST_HISTORY_SORT_DESC", "WATCHLIST_HISTORY_SORT_DESC", sort_desc_default),
             self.watchlist_history_sort_column in {"delta", "score_now"},
         )
-        self.ui_compact_menus_enabled = self._to_bool(
-            self._setting_raw("UI_COMPACT_MENUS_ENABLED", "UI_COMPACT_MENUS_ENABLED", "1"),
+        # UI compact menus remain enabled to avoid action overflow and hidden controls.
+        self.ui_compact_menus_enabled = True
+        # UI V3 premium rollout is big-bang global. We keep the persisted key for backward
+        # compatibility, but effective runtime state is always enabled.
+        _ui_v2_enabled_saved = self._to_bool(
+            self._setting_raw(
+                "UI_V2_ENABLED",
+                "UI_V2_ENABLED",
+                "1" if getattr(self, "ui_v2_enabled", True) else "0",
+            ),
             True,
         )
+        self.ui_v2_enabled = True if _ui_v2_enabled_saved else True
+        self.ui_v2_theme = normalize_ui_v2_theme(
+            self._setting_raw("UI_V2_THEME", "UI_V2_THEME", getattr(self, "ui_v2_theme", "system")),
+            "system",
+        )
+        self.ui_v2_density = normalize_ui_v2_density(
+            self._setting_raw("UI_V2_DENSITY", "UI_V2_DENSITY", getattr(self, "ui_v2_density", "comfortable")),
+            "comfortable",
+        )
+        self.ui_v2_motion_profile = normalize_ui_v2_motion_profile(
+            self._setting_raw(
+                "UI_V2_MOTION_PROFILE",
+                "UI_V2_MOTION_PROFILE",
+                getattr(self, "ui_v2_motion_profile", "max"),
+            ),
+            "max",
+        )
+        self.ui_v2_layout_profile = normalize_ui_v2_layout_profile(
+            self._setting_raw(
+                "UI_V2_LAYOUT_PROFILE",
+                "UI_V2_LAYOUT_PROFILE",
+                getattr(self, "ui_v2_layout_profile", "premium_glass_clinic"),
+            ),
+            "premium_glass_clinic",
+        )
+        self.ui_v2_scale_percent = normalize_ui_v2_scale_percent(
+            self._setting_raw(
+                "UI_V2_SCALE_PERCENT",
+                "UI_V2_SCALE_PERCENT",
+                str(getattr(self, "ui_v2_scale_percent", 100)),
+            ),
+            100,
+        )
+        self.ui_v2_enable_command_palette = self._to_bool(
+            self._setting_raw(
+                "UI_V2_ENABLE_COMMAND_PALETTE",
+                "UI_V2_ENABLE_COMMAND_PALETTE",
+                "1" if getattr(self, "ui_v2_enable_command_palette", True) else "0",
+            ),
+            True,
+        )
+        self.ui_v2_enable_toasts = self._to_bool(
+            self._setting_raw(
+                "UI_V2_ENABLE_TOASTS",
+                "UI_V2_ENABLE_TOASTS",
+                "1" if getattr(self, "ui_v2_enable_toasts", True) else "0",
+            ),
+            True,
+        )
+        self.ui_v2_visual_style = normalize_ui_v2_visual_style(
+            self._setting_raw("UI_V2_VISUAL_STYLE", "UI_V2_VISUAL_STYLE", getattr(self, "ui_v2_visual_style", "premium")),
+            "premium",
+        )
+        self.ui_v2_chrome_mode = normalize_ui_v2_chrome_mode(
+            self._setting_raw("UI_V2_CHROME_MODE", "UI_V2_CHROME_MODE", getattr(self, "ui_v2_chrome_mode", "modern")),
+            "modern",
+        )
+        self.ui_v2_enable_glass_surface = self._to_bool(
+            self._setting_raw(
+                "UI_V2_ENABLE_GLASS_SURFACE",
+                "UI_V2_ENABLE_GLASS_SURFACE",
+                "1" if getattr(self, "ui_v2_enable_glass_surface", True) else "0",
+            ),
+            True,
+        )
+        self.ui_v2_enable_animations = self._to_bool(
+            self._setting_raw(
+                "UI_V2_ENABLE_ANIMATIONS",
+                "UI_V2_ENABLE_ANIMATIONS",
+                "1" if getattr(self, "ui_v2_enable_animations", True) else "0",
+            ),
+            True,
+        )
+        self.ui_v2_tab_flags_json = self._setting_raw(
+            "UI_V2_TAB_FLAGS_JSON",
+            "UI_V2_TAB_FLAGS_JSON",
+            getattr(self, "ui_v2_tab_flags_json", ""),
+        ).strip()
+        self.ui_v2_tab_flags = self._normalize_ui_v2_tab_flags_big_bang(self.ui_v2_tab_flags_json)
+        self.ui_v2_tab_flags_json = json.dumps(self.ui_v2_tab_flags, ensure_ascii=False, sort_keys=True)
         self.dashboard_filter_department_default = self._setting_raw(
             "DASHBOARD_FILTER_DEPARTMENT",
             "DASHBOARD_FILTER_DEPARTMENT",
@@ -11336,9 +11814,27 @@ class PacientiAIApp:
         )
 
     def _configure_enterprise_api_runtime(self) -> None:
-        os.environ["PACIENTI_DB_BACKEND"] = (self.api_internal_db_backend or "sqlite").strip().lower() or "sqlite"
+        db_mode = (getattr(self, "api_internal_db_mode", "sqlite") or "sqlite").strip().lower() or "sqlite"
+        if db_mode not in {"sqlite", "shadow", "postgres_primary"}:
+            db_mode = "sqlite"
+        if db_mode == "postgres_primary":
+            runtime_backend = "postgres"
+        elif db_mode == "shadow":
+            runtime_backend = "sqlite"
+        else:
+            runtime_backend = (self.api_internal_db_backend or "sqlite").strip().lower() or "sqlite"
+            if runtime_backend not in {"sqlite", "postgres"}:
+                runtime_backend = "sqlite"
+        os.environ["PACIENTI_DB_MODE"] = db_mode
+        os.environ["PACIENTI_DB_BACKEND"] = runtime_backend
         os.environ["PACIENTI_POSTGRES_CONNECT_TIMEOUT_SECONDS"] = str(
             max(1, int(self.api_internal_postgres_connect_timeout_seconds or 2))
+        )
+        os.environ["PACIENTI_POSTGRES_PRIMARY_ENABLED"] = (
+            "1" if bool(getattr(self, "api_internal_postgres_primary_enabled", False)) else "0"
+        )
+        os.environ["PACIENTI_POSTGRES_REQUIRE_TLS"] = (
+            "1" if bool(getattr(self, "api_internal_postgres_require_tls", True)) else "0"
         )
         os.environ["PACIENTI_POSTGRES_SHADOW_ENABLED"] = (
             "1" if bool(getattr(self, "api_internal_postgres_shadow_enabled", False)) else "0"
@@ -11355,6 +11851,12 @@ class PacientiAIApp:
         os.environ["PACIENTI_POSTGRES_SHADOW_STOP_ON_ERROR_RATE"] = (
             f"{max(0.0, min(1.0, float(getattr(self, 'api_internal_postgres_shadow_stop_on_error_rate', 0.5) or 0.5))):.3f}"
         )
+        os.environ["PACIENTI_OFFLINE_SYNC_ENABLED"] = (
+            "1" if bool(getattr(self, "api_internal_offline_sync_enabled", True)) else "0"
+        )
+        os.environ["PACIENTI_OFFLINE_SYNC_BATCH_SIZE"] = str(
+            max(1, int(getattr(self, "api_internal_offline_sync_batch_size", 100) or 100))
+        )
         self.enterprise_api_client.configure(
             base_url=self.api_internal_base_url,
             timeout_seconds=self.api_internal_timeout_seconds,
@@ -11367,17 +11869,23 @@ class PacientiAIApp:
         self.enterprise_logger.info(
             (
                 "enterprise api runtime configured: enabled=%s base=%s timeout=%s "
-                "backend=%s pg_timeout=%s shadow=%s shadow_batch=%s shadow_retries=%s "
+                "mode=%s backend=%s pg_primary=%s pg_tls=%s pg_timeout=%s "
+                "shadow=%s shadow_batch=%s shadow_retries=%s offline_sync=%s offline_batch=%s "
                 "use_for_read=%s use_for_diag=%s use_for_write=%s"
             ),
             bool(self.api_internal_enabled),
             self.api_internal_base_url,
             int(self.api_internal_timeout_seconds),
+            os.environ.get("PACIENTI_DB_MODE", "sqlite"),
             os.environ.get("PACIENTI_DB_BACKEND", "sqlite"),
+            os.environ.get("PACIENTI_POSTGRES_PRIMARY_ENABLED", "0"),
+            os.environ.get("PACIENTI_POSTGRES_REQUIRE_TLS", "1"),
             os.environ.get("PACIENTI_POSTGRES_CONNECT_TIMEOUT_SECONDS", "2"),
             os.environ.get("PACIENTI_POSTGRES_SHADOW_ENABLED", "0"),
             os.environ.get("PACIENTI_POSTGRES_SHADOW_BATCH_SIZE", "50"),
             os.environ.get("PACIENTI_POSTGRES_SHADOW_MAX_RETRIES", "3"),
+            os.environ.get("PACIENTI_OFFLINE_SYNC_ENABLED", "1"),
+            os.environ.get("PACIENTI_OFFLINE_SYNC_BATCH_SIZE", "100"),
             bool(self.api_internal_use_for_patient_read),
             bool(self.api_internal_use_for_diagnosis),
             bool(self.api_internal_use_for_patient_write),
@@ -11493,7 +12001,627 @@ class PacientiAIApp:
             return True
         return role in set(self.ai_allowed_roles)
 
+    @staticmethod
+    def _normalize_ui_v2_tab_flags_big_bang(raw: str) -> Dict[str, bool]:
+        loaded = parse_ui_v2_tab_flags(raw, known_tabs=UI_V2_TAB_DEFAULTS)
+        out: Dict[str, bool] = {}
+        for key in set(UI_V2_TAB_DEFAULTS).union(set(loaded.keys())):
+            slug = str(key or "").strip()
+            if not slug:
+                continue
+            out[slug] = True
+        return out
+
+    def _init_ui_v2_runtime(self) -> None:
+        self.ui_v2_enabled = True
+        self.ui_v2_theme = normalize_ui_v2_theme(getattr(self, "ui_v2_theme", "system"), "system")
+        self.ui_v2_density = normalize_ui_v2_density(getattr(self, "ui_v2_density", "comfortable"), "comfortable")
+        self.ui_v2_motion_profile = normalize_ui_v2_motion_profile(
+            getattr(self, "ui_v2_motion_profile", "max"),
+            "max",
+        )
+        self.ui_v2_layout_profile = normalize_ui_v2_layout_profile(
+            getattr(self, "ui_v2_layout_profile", "premium_glass_clinic"),
+            "premium_glass_clinic",
+        )
+        self.ui_v2_scale_percent = normalize_ui_v2_scale_percent(str(getattr(self, "ui_v2_scale_percent", 100)), 100)
+        self.ui_v2_visual_style = normalize_ui_v2_visual_style(
+            getattr(self, "ui_v2_visual_style", "premium"),
+            "premium",
+        )
+        self.ui_v2_chrome_mode = normalize_ui_v2_chrome_mode(
+            getattr(self, "ui_v2_chrome_mode", "modern"),
+            "modern",
+        )
+        self.ui_v2_tab_flags = self._normalize_ui_v2_tab_flags_big_bang(getattr(self, "ui_v2_tab_flags_json", ""))
+        self.ui_v2_tab_flags_json = json.dumps(self.ui_v2_tab_flags, ensure_ascii=False, sort_keys=True)
+        if self.ui_v2_theme_manager is None:
+            self.ui_v2_theme_manager = UIv2ThemeManager(self.root)
+        result = self.ui_v2_theme_manager.apply(
+            theme=self.ui_v2_theme,
+            density=self.ui_v2_density,
+            scale_percent=self.ui_v2_scale_percent,
+            visual_style=self.ui_v2_visual_style,
+            chrome_mode=self.ui_v2_chrome_mode,
+            enable_glass_surface=bool(getattr(self, "ui_v2_enable_glass_surface", True)),
+            motion_profile=self.ui_v2_motion_profile,
+            layout_profile=self.ui_v2_layout_profile,
+        )
+        palette = result.get("palette") if isinstance(result, dict) else {}
+        self.ui_v2_palette = dict(palette or {})
+        if self.ui_v2_command_palette is None:
+            self.ui_v2_command_palette = CommandPalette(self.root)
+        self._bind_ui_v2_shortcuts()
+        self._install_ui_v2_showinfo_proxy()
+
+    def _bind_ui_v2_shortcuts(self) -> None:
+        if bool(getattr(self, "_ui_v2_shortcuts_bound", False)):
+            return
+        self.root.bind_all("<Control-k>", self._on_command_palette_shortcut)
+        self.root.bind_all("<Control-K>", self._on_command_palette_shortcut)
+        self.root.bind_all("<F5>", lambda _e: self.request_dashboard_refresh())
+        self.root.bind_all("<Control-r>", lambda _e: self.refresh_patients())
+        self.root.bind_all("<Control-R>", lambda _e: self.refresh_patients())
+        self.root.bind_all("<Control-s>", self._on_global_save_shortcut)
+        self.root.bind_all("<Control-S>", self._on_global_save_shortcut)
+        self.root.bind_all("<Control-f>", self._on_focus_patient_search_shortcut)
+        self.root.bind_all("<Control-F>", self._on_focus_patient_search_shortcut)
+        self.root.bind_all("<Control-Next>", self._on_next_tab_shortcut)
+        self.root.bind_all("<Control-Prior>", self._on_prev_tab_shortcut)
+        self._ui_v2_shortcuts_bound = True
+
+    def _on_command_palette_shortcut(self, _event: Any = None) -> str:
+        self.open_command_palette()
+        return "break"
+
+    def _select_notebook_relative(self, offset: int) -> None:
+        if not hasattr(self, "notebook") or self.notebook is None:
+            return
+        tabs = list(self.notebook.tabs())
+        if not tabs:
+            return
+        try:
+            current = str(self.notebook.select() or "")
+        except Exception:
+            current = ""
+        try:
+            idx = tabs.index(current)
+        except Exception:
+            idx = 0
+        new_idx = (idx + int(offset)) % len(tabs)
+        try:
+            self.notebook.select(tabs[new_idx])
+        except Exception:
+            return
+
+    def _on_next_tab_shortcut(self, _event: Any = None) -> str:
+        if not bool(getattr(self, "ui_v2_enabled", False)):
+            return "break"
+        self._select_notebook_relative(1)
+        return "break"
+
+    def _on_prev_tab_shortcut(self, _event: Any = None) -> str:
+        if not bool(getattr(self, "ui_v2_enabled", False)):
+            return "break"
+        self._select_notebook_relative(-1)
+        return "break"
+
+    def _on_focus_patient_search_shortcut(self, _event: Any = None) -> str:
+        if not bool(getattr(self, "ui_v2_enabled", False)):
+            return "break"
+        if self.search_entry is not None:
+            try:
+                self.search_entry.focus_set()
+                self.search_entry.selection_range(0, tk.END)
+            except Exception:
+                pass
+        return "break"
+
+    def _on_global_save_shortcut(self, _event: Any = None) -> str:
+        if not bool(getattr(self, "ui_v2_enabled", False)):
+            return "break"
+        current_tab = ""
+        if hasattr(self, "notebook") and self.notebook is not None:
+            try:
+                tab_id = self.notebook.select()
+                current_tab = str(self.notebook.tab(tab_id, "text") or "")
+            except Exception:
+                current_tab = ""
+        if current_tab == "Fisa pacient":
+            self.save_patient()
+            self._show_toast("Salvare fisa pacient executata (Ctrl+S).", level="success")
+            return "break"
+        if current_tab == "Setari" and self._has_role("admin"):
+            self.save_admin_settings(True)
+            self._show_toast("Setari salvate (Ctrl+S).", level="success")
+            return "break"
+        self._show_toast("Ctrl+S este disponibil pentru Fisa pacient / Setari.", level="warning")
+        return "break"
+
+    def _install_ui_v2_showinfo_proxy(self) -> None:
+        should_proxy = bool(self.ui_v2_enabled and self.ui_v2_enable_toasts)
+        if should_proxy and not bool(getattr(self, "_messagebox_showinfo_proxy_installed", False)):
+            self._messagebox_showinfo_original = messagebox.showinfo
+
+            def _showinfo_proxy(title: str = "", message: str = "", *args: Any, **kwargs: Any) -> str:
+                text = f"{title}: {message}" if title else str(message)
+                self._show_toast(text, level="info", duration_ms=4200)
+                return "ok"
+
+            messagebox.showinfo = _showinfo_proxy
+            self._messagebox_showinfo_proxy_installed = True
+            return
+        if (not should_proxy) and bool(getattr(self, "_messagebox_showinfo_proxy_installed", False)):
+            original = getattr(self, "_messagebox_showinfo_original", None)
+            if callable(original):
+                messagebox.showinfo = original  # type: ignore[assignment]
+            self._messagebox_showinfo_proxy_installed = False
+
+    def _build_global_status_bar(self) -> None:
+        if self.toast_status_var is not None:
+            return
+        palette = dict(getattr(self, "ui_v2_palette", {}) or {})
+        fg = str(palette.get("text_muted") or "#475569")
+        bar_style = "ModernCard.TFrame" if bool(getattr(self, "ui_v2_enabled", False)) else "TFrame"
+        bar = ttk.Frame(self.root, style=bar_style)
+        bar.pack(fill="x", padx=8, pady=(0, 8))
+        if bool(getattr(self, "ui_v2_enabled", False)):
+            self.ui_v2_feedback_center = FeedbackCenter(bar)
+            self.toast_status_var = self.ui_v2_feedback_center.var
+            self.toast_status_label = self.ui_v2_feedback_center.label
+            self.ui_v2_feedback_center.set_inline("Ready.", level="info")
+            return
+        self.toast_status_var = tk.StringVar(value="Ready.")
+        self.toast_status_label = ttk.Label(bar, textvariable=self.toast_status_var, foreground=fg)
+        self.toast_status_label.pack(side=LEFT, fill="x", expand=True)
+
+    def _show_toast(self, message: str, *, level: str = "info", duration_ms: int = 3200) -> None:
+        text = str(message or "").strip()
+        if not text:
+            return
+        if self.toast_status_var is None:
+            return
+        palette = dict(getattr(self, "ui_v2_palette", {}) or {})
+        color_map = {
+            "info": str(palette.get("text_muted") or "#475569"),
+            "success": str(palette.get("success") or "#166534"),
+            "warning": str(palette.get("warning") or "#b45309"),
+            "error": str(palette.get("error") or "#b91c1c"),
+        }
+        corr_match = re.search(r"\bcorr(?:elation)?[=: ]+([A-Za-z0-9_-]{6,})", text, flags=re.IGNORECASE)
+        corr_value = corr_match.group(1) if corr_match else ""
+        if self.ui_v2_feedback_center is not None:
+            self.ui_v2_feedback_center.set_inline(text, level=level, correlation_id=corr_value)
+        self.toast_status_var.set(text)
+        if self.toast_status_label is not None:
+            try:
+                self.toast_status_label.configure(foreground=color_map.get(level, color_map["info"]))
+            except Exception:
+                pass
+        if self._toast_job:
+            try:
+                self.root.after_cancel(self._toast_job)
+            except Exception:
+                pass
+            self._toast_job = None
+        def _reset_status() -> None:
+            if self.toast_status_var is not None:
+                self.toast_status_var.set("Ready.")
+            if self.toast_status_label is not None:
+                try:
+                    self.toast_status_label.configure(foreground=color_map["info"])
+                except Exception:
+                    pass
+            if self.ui_v2_feedback_center is not None:
+                self.ui_v2_feedback_center.set_inline("Ready.", level="info")
+
+        motion_profile = normalize_ui_v2_motion_profile(
+            str(getattr(self, "ui_v2_motion_profile", "max") or "max"),
+            "max",
+        )
+        if not bool(getattr(self, "ui_v2_enable_animations", True)):
+            motion_factor = 0.85
+        elif motion_profile == "low":
+            motion_factor = 0.85
+        elif motion_profile == "balanced":
+            motion_factor = 1.0
+        else:
+            motion_factor = 1.15
+        effective_duration = max(1200, int(float(duration_ms) * motion_factor))
+        self._toast_job = self.root.after(effective_duration, _reset_status)
+
+    def _select_notebook_tab_by_label(self, label: str) -> None:
+        if not hasattr(self, "notebook") or self.notebook is None:
+            return
+        target = (label or "").strip()
+        if not target:
+            return
+        for tab_id in self.notebook.tabs():
+            text = str(self.notebook.tab(tab_id, "text") or "")
+            if text == target:
+                self.notebook.select(tab_id)
+                return
+
+    @staticmethod
+    def _ui_v2_tab_key_for_label(label: str) -> str:
+        text = (label or "").strip().lower()
+        mapping = {
+            "dashboard": "dashboard",
+            "statistici": "statistics",
+            "parteneri": "partners",
+            "fisa pacient": "patient",
+            "istoric pacient 360": "patient_history",
+            "note clinice": "visits",
+            "internari": "admissions",
+            "ordine": "orders",
+            "vitale": "vitals",
+            "asistent ai": "ai",
+            "audit": "audit",
+            "utilizatori": "users",
+            "setari": "settings",
+        }
+        return mapping.get(text, text.replace(" ", "_"))
+
+    def _ui_v2_tab_enabled(self, label: str) -> bool:
+        key = self._ui_v2_tab_key_for_label(label)
+        flags = dict(getattr(self, "ui_v2_tab_flags", {}) or {})
+        if not flags:
+            return True
+        return bool(flags.get(key, True))
+
+    def _on_notebook_tab_changed_v2(self, _event: Any = None) -> None:
+        if not bool(getattr(self, "ui_v2_enabled", False)):
+            return
+        if not hasattr(self, "notebook") or self.notebook is None:
+            return
+        try:
+            tab_id = self.notebook.select()
+            tab_text = str(self.notebook.tab(tab_id, "text") or "")
+        except Exception:
+            tab_text = ""
+        if not tab_text:
+            return
+        if self._ui_v2_tab_enabled(tab_text):
+            self._show_toast(f"Modul activ: {tab_text} (UI V2).", level="info", duration_ms=1200)
+        else:
+            self._show_toast(f"Modul activ: {tab_text} (fallback V1).", level="warning", duration_ms=1800)
+
+    def _collect_command_palette_items(self) -> List[Dict[str, Any]]:
+        items: List[Dict[str, Any]] = []
+        if hasattr(self, "notebook") and self.notebook is not None:
+            for tab_id in self.notebook.tabs():
+                tab_text = str(self.notebook.tab(tab_id, "text") or "").strip()
+                if not tab_text:
+                    continue
+                suffix = "" if self._ui_v2_tab_enabled(tab_text) else " [V1]"
+                items.append(
+                    {
+                        "label": f"Navigare: {tab_text}{suffix}",
+                        "action": (lambda t=tab_text: self._select_notebook_tab_by_label(t)),
+                    }
+                )
+        actions: List[Tuple[str, Callable[[], Any]]] = [
+            ("Navigare: Tab urmator", lambda: self._select_notebook_relative(1)),
+            ("Navigare: Tab anterior", lambda: self._select_notebook_relative(-1)),
+            ("Pacienti: Reincarca", self.refresh_patients),
+            ("Pacienti: Focus cautare", lambda: self._on_focus_patient_search_shortcut()),
+            ("Dashboard: Refresh", self.request_dashboard_refresh),
+            ("Fisa pacient: Salveaza", self.save_patient),
+            ("Setari: Deschide tab", self.open_ui_settings_tab),
+            ("Integrari: Proceseaza queue acum", self.process_integration_queue_now),
+            ("Integrari: Proceseaza shadow sync", self.process_shadow_sync_now),
+            ("Ops: Health API", self.show_api_health_popup),
+            ("Ops: Status DB mode", self.show_db_mode_status_popup),
+            ("Ops: Reconciliere", self.show_reconciliation_status_popup),
+            ("Ops: Heartbeat statii", self.show_station_heartbeats_popup),
+        ]
+        for label, callback in actions:
+            items.append({"label": label, "action": callback})
+
+        seen = {str(item.get("label") or "").strip().lower() for item in items}
+        current_tab_key = self._current_notebook_tab_key()
+        for tab_key in ("global", current_tab_key):
+            for item in self.overflow_palette_actions.get(tab_key, []):
+                label = str(item.get("label") or "").strip()
+                action = item.get("action")
+                if not label or not callable(action):
+                    continue
+                norm = label.lower()
+                if norm in seen:
+                    continue
+                seen.add(norm)
+                items.append({"label": label, "action": action})
+        return items
+
+    def _build_ui_v2_tab_navigator(self) -> None:
+        wrap = getattr(self, "ui_v2_tab_nav_wrap", None)
+        if wrap is None or not hasattr(self, "notebook") or self.notebook is None:
+            return
+        for child in wrap.winfo_children():
+            try:
+                child.destroy()
+            except Exception:
+                pass
+        ttk.Label(wrap, text="Module", font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=6, pady=(6, 4))
+        for tab_id in self.notebook.tabs():
+            tab_text = str(self.notebook.tab(tab_id, "text") or "").strip()
+            if not tab_text:
+                continue
+            btn_label = tab_text if self._ui_v2_tab_enabled(tab_text) else f"{tab_text} (V1)"
+            ttk.Button(
+                wrap,
+                text=btn_label,
+                command=(lambda t=tab_text: self._select_notebook_tab_by_label(t)),
+                width=22,
+            ).pack(fill="x", padx=6, pady=2)
+
+    def _refresh_ui_v2_theme_quick_button_label(self) -> None:
+        btn = getattr(self, "ui_v2_theme_quick_button", None)
+        if btn is None:
+            return
+        theme = normalize_ui_v2_theme(str(getattr(self, "ui_v2_theme", "system") or "system"), "system")
+        title = "Auto" if theme == "system" else ("Light" if theme == "light" else "Dark")
+        try:
+            btn.configure(text=f"Tema: {title}")
+        except Exception:
+            pass
+
+    def _set_ui_v2_theme_runtime(self, theme: str, *, persist: bool = True) -> None:
+        target = normalize_ui_v2_theme(str(theme or "system"), "system")
+        self.ui_v2_theme = target
+        if self.ui_v2_theme_manager is None:
+            self.ui_v2_theme_manager = UIv2ThemeManager(self.root)
+        result = self.ui_v2_theme_manager.apply(
+            theme=self.ui_v2_theme,
+            density=self.ui_v2_density,
+            scale_percent=self.ui_v2_scale_percent,
+            visual_style=self.ui_v2_visual_style,
+            chrome_mode=self.ui_v2_chrome_mode,
+            enable_glass_surface=bool(getattr(self, "ui_v2_enable_glass_surface", True)),
+            motion_profile=getattr(self, "ui_v2_motion_profile", "max"),
+            layout_profile=getattr(self, "ui_v2_layout_profile", "premium_glass_clinic"),
+        )
+        palette = result.get("palette") if isinstance(result, dict) else {}
+        self.ui_v2_palette = dict(palette or {})
+        self._refresh_ui_v2_theme_quick_button_label()
+        if persist:
+            try:
+                self.db.set_setting("UI_V2_THEME", self.ui_v2_theme)
+            except Exception:
+                pass
+        self._show_toast(
+            f"Tema UI V2 setata pe '{self.ui_v2_theme}'.",
+            level="info",
+            duration_ms=1800,
+        )
+
+    def _build_ui_v2_theme_quick_menu(self, parent: ttk.Frame) -> None:
+        menu_btn = ttk.Menubutton(parent, text="Tema: Auto", takefocus=True)
+        menu = tk.Menu(menu_btn, tearoff=False)
+        menu.add_command(label="Auto (System)", command=lambda: self._set_ui_v2_theme_runtime("system"))
+        menu.add_command(label="Light", command=lambda: self._set_ui_v2_theme_runtime("light"))
+        menu.add_command(label="Dark", command=lambda: self._set_ui_v2_theme_runtime("dark"))
+        menu_btn.configure(menu=menu)
+        menu_btn.pack(side=RIGHT, padx=(0, 8))
+        self.ui_v2_theme_quick_button = menu_btn
+        self._refresh_ui_v2_theme_quick_button_label()
+
+    def _reapply_ui_v2_style_runtime(self) -> None:
+        if self.ui_v2_theme_manager is None:
+            self.ui_v2_theme_manager = UIv2ThemeManager(self.root)
+        result = self.ui_v2_theme_manager.apply(
+            theme=self.ui_v2_theme,
+            density=self.ui_v2_density,
+            scale_percent=self.ui_v2_scale_percent,
+            visual_style=self.ui_v2_visual_style,
+            chrome_mode=self.ui_v2_chrome_mode,
+            enable_glass_surface=bool(getattr(self, "ui_v2_enable_glass_surface", True)),
+            motion_profile=getattr(self, "ui_v2_motion_profile", "max"),
+            layout_profile=getattr(self, "ui_v2_layout_profile", "premium_glass_clinic"),
+        )
+        palette = result.get("palette") if isinstance(result, dict) else {}
+        self.ui_v2_palette = dict(palette or {})
+
+    def _set_ui_v2_density_runtime(self, density: str, *, persist: bool = True) -> None:
+        target = normalize_ui_v2_density(str(density or "comfortable"), "comfortable")
+        self.ui_v2_density = target
+        self._reapply_ui_v2_style_runtime()
+        if self.ui_v2_density_quick_button is not None:
+            try:
+                self.ui_v2_density_quick_button.configure(text=f"Densitate: {self.ui_v2_density}")
+            except Exception:
+                pass
+        if persist:
+            try:
+                self.db.set_setting("UI_V2_DENSITY", self.ui_v2_density)
+            except Exception:
+                pass
+        self._show_toast(f"Densitate UI setata pe '{self.ui_v2_density}'.", level="info", duration_ms=1600)
+
+    def _set_ui_v2_scale_runtime(self, scale_percent: int, *, persist: bool = True) -> None:
+        self.ui_v2_scale_percent = normalize_ui_v2_scale_percent(str(scale_percent or 100), 100)
+        self._reapply_ui_v2_style_runtime()
+        if self.ui_v2_scale_quick_button is not None:
+            try:
+                self.ui_v2_scale_quick_button.configure(text=f"Scale: {int(self.ui_v2_scale_percent)}%")
+            except Exception:
+                pass
+        if persist:
+            try:
+                self.db.set_setting("UI_V2_SCALE_PERCENT", str(self.ui_v2_scale_percent))
+            except Exception:
+                pass
+        self._show_toast(f"Scale UI setat pe {self.ui_v2_scale_percent}%.", level="info", duration_ms=1600)
+
+    def _set_ui_v2_motion_profile_runtime(self, motion_profile: str, *, persist: bool = True) -> None:
+        self.ui_v2_motion_profile = normalize_ui_v2_motion_profile(str(motion_profile or "max"), "max")
+        self._reapply_ui_v2_style_runtime()
+        if self.ui_v2_motion_quick_button is not None:
+            try:
+                self.ui_v2_motion_quick_button.configure(text=f"Motion: {self.ui_v2_motion_profile}")
+            except Exception:
+                pass
+        if persist:
+            try:
+                self.db.set_setting("UI_V2_MOTION_PROFILE", self.ui_v2_motion_profile)
+            except Exception:
+                pass
+        self._show_toast(f"Motion profile setat pe '{self.ui_v2_motion_profile}'.", level="info", duration_ms=1600)
+
+    def _build_ui_v2_density_quick_menu(self, parent: ttk.Frame) -> None:
+        menu_btn = ttk.Menubutton(parent, text=f"Densitate: {self.ui_v2_density}", takefocus=True)
+        menu = tk.Menu(menu_btn, tearoff=False)
+        menu.add_command(label="Compact", command=lambda: self._set_ui_v2_density_runtime("compact"))
+        menu.add_command(label="Comfortable", command=lambda: self._set_ui_v2_density_runtime("comfortable"))
+        menu_btn.configure(menu=menu)
+        menu_btn.pack(side=RIGHT, padx=(0, 8))
+        self.ui_v2_density_quick_button = menu_btn
+
+    def _build_ui_v2_scale_quick_menu(self, parent: ttk.Frame) -> None:
+        menu_btn = ttk.Menubutton(parent, text=f"Scale: {int(self.ui_v2_scale_percent)}%", takefocus=True)
+        menu = tk.Menu(menu_btn, tearoff=False)
+        for pct in (90, 100, 110, 120, 130):
+            menu.add_command(label=f"{pct}%", command=lambda value=pct: self._set_ui_v2_scale_runtime(value))
+        menu_btn.configure(menu=menu)
+        menu_btn.pack(side=RIGHT, padx=(0, 8))
+        self.ui_v2_scale_quick_button = menu_btn
+
+    def _build_ui_v2_motion_quick_menu(self, parent: ttk.Frame) -> None:
+        current = normalize_ui_v2_motion_profile(getattr(self, "ui_v2_motion_profile", "max"), "max")
+        menu_btn = ttk.Menubutton(parent, text=f"Motion: {current}", takefocus=True)
+        menu = tk.Menu(menu_btn, tearoff=False)
+        menu.add_command(label="Low", command=lambda: self._set_ui_v2_motion_profile_runtime("low"))
+        menu.add_command(label="Balanced", command=lambda: self._set_ui_v2_motion_profile_runtime("balanced"))
+        menu.add_command(label="Max", command=lambda: self._set_ui_v2_motion_profile_runtime("max"))
+        menu_btn.configure(menu=menu)
+        menu_btn.pack(side=RIGHT, padx=(0, 8))
+        self.ui_v2_motion_quick_button = menu_btn
+
+    def open_command_palette(self) -> None:
+        if not bool(getattr(self, "ui_v2_enabled", False)):
+            return
+        if not bool(getattr(self, "ui_v2_enable_command_palette", True)):
+            self._show_toast("Command palette este dezactivat din Setari.", level="warning")
+            return
+        if self.ui_v2_command_palette is None:
+            self.ui_v2_command_palette = CommandPalette(self.root)
+        self.ui_v2_command_palette.open(self._collect_command_palette_items())
+
+    def _build_ui_v2(self) -> None:
+        palette = dict(getattr(self, "ui_v2_palette", {}) or {})
+        role_label = self.current_user.get("role", "")
+        user_label = self.current_user.get("display_name", self.current_user.get("username", ""))
+        self.ui_v2_shell = ShellV2(self.root, palette=palette)
+        shell_nodes = self.ui_v2_shell.build(
+            title=f"{DEFAULT_HOSPITAL_NAME} | {user_label} ({role_label}) | UI V2 Premium",
+            subtitle="Premium Glass Clinic | theme system | overflow + command palette",
+        )
+        right_tools = shell_nodes.get("right")
+        if not isinstance(right_tools, ttk.Frame):
+            right_tools = ttk.Frame(shell_nodes.get("top"), style="ModernCard.TFrame")
+            right_tools.pack(side=RIGHT)
+        self._init_ui_compact_toolbar_styles()
+        self.guardrail_var = tk.StringVar(value="Mod spital activ: audit + fluxuri internare")
+        status_surface = ttk.Frame(right_tools, style="ModernCard.TFrame")
+        status_surface.pack(fill="x")
+        ttk.Label(status_surface, textvariable=self.guardrail_var, foreground="#1d4ed8").pack(side=LEFT, padx=(0, 10))
+        self.alert_status_var = tk.StringVar(value="Alerte critice: monitorizare activa")
+        self.alert_status_label = tk.Label(status_surface, textvariable=self.alert_status_var, fg="#b91c1c")
+        self.alert_status_label.pack(side=LEFT, padx=(0, 10))
+        self.ui_compact_status_var = tk.StringVar()
+        self.ui_compact_status_button = None
+        self.ui_compact_status_label = None
+        self._refresh_ui_compact_toolbar_status()
+        if self._has_role("admin"):
+            self.ui_compact_status_button = ttk.Button(
+                status_surface,
+                textvariable=self.ui_compact_status_var,
+                command=self.toggle_ui_compact_from_toolbar,
+                style="UICompactOff.TButton",
+            )
+            self.ui_compact_status_button.pack(side=LEFT, padx=(0, 10))
+        else:
+            self.ui_compact_status_label = ttk.Label(
+                status_surface,
+                textvariable=self.ui_compact_status_var,
+                style="UICompactOff.TLabel",
+            )
+            self.ui_compact_status_label.pack(side=LEFT, padx=(0, 10))
+        self._refresh_ui_compact_toolbar_status()
+        action_surface = ttk.Frame(right_tools, style="ModernCard.TFrame")
+        action_surface.pack(fill="x", pady=(6, 0))
+        toolbar_actions = ActionBarV2(action_surface)
+        toolbar_actions.add_primary(text="Muta alerte 5m", command=self.mute_alerts_5m, style="Secondary.TButton")
+        toolbar_actions.add_primary(
+            text="Test notificari",
+            command=self.test_external_notifications,
+            style="Secondary.TButton",
+        )
+        toolbar_actions.add_primary(text="Ctrl+K", command=self.open_command_palette)
+        toolbar_actions.add_primary(text="Backup acum", command=self.create_manual_backup, style="Secondary.TButton")
+        toolbar_actions.add_primary(
+            text="Restore backup",
+            command=self.restore_backup_dialog,
+            style="Secondary.TButton",
+        )
+        toolbar_actions.add_primary(text="Schimba parola", command=self.change_my_password)
+        if self._has_role("admin"):
+            toolbar_actions.add_primary(
+                text="Setari UI",
+                command=self.open_ui_settings_tab,
+                padx=0,
+                style="Secondary.TButton",
+            )
+        self._group_actions_into_menus(
+            parent=toolbar_actions.left,
+            context_key="toolbar_operatiuni_sistem_v2",
+            menu_specs=[
+                {
+                    "menu_label": "Operatiuni sistem",
+                    "pack_padx": (0, 10),
+                    "entries": [
+                        {"label": "Muta alerte 5m"},
+                        {"label": "Test notificari"},
+                        {"label": "Backup acum"},
+                        {"label": "Restore backup"},
+                    ],
+                }
+            ],
+            source_frames=[toolbar_actions.left],
+        )
+        self._install_action_overflow(
+            parent=toolbar_actions.left,
+            context_key="toolbar_operatiuni_sistem_v2",
+            primary_labels=["Ctrl+K", "Schimba parola", "Setari UI"],
+            overflow_menu_label="More",
+        )
+        self._build_ui_v2_motion_quick_menu(toolbar_actions.right)
+        self._build_ui_v2_scale_quick_menu(toolbar_actions.right)
+        self._build_ui_v2_density_quick_menu(toolbar_actions.right)
+        self._build_ui_v2_theme_quick_menu(toolbar_actions.right)
+        hint_surface = ttk.Frame(right_tools, style="ModernCard.TFrame")
+        hint_surface.pack(fill="x", pady=(4, 0))
+        ttk.Label(
+            hint_surface,
+            text="Scurtaturi: Ctrl+K palette | Ctrl+S salvare | Ctrl+R reincarcare pacienti | Ctrl+PgUp/PgDn tab | F5 dashboard",
+            style="ModernCardSubTitle.TLabel",
+        ).pack(side=LEFT)
+
+        main = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
+        main.pack(fill=BOTH, expand=True, padx=10, pady=10)
+        left = ttk.Frame(main, width=350)
+        right = ttk.Frame(main)
+        main.add(left, weight=1)
+        main.add(right, weight=3)
+        self._build_patients_panel(left)
+        self._build_right_panel(right)
+        self._build_global_status_bar()
+        self._show_toast("UI V2 activ. Ctrl+K pentru command palette.", level="success", duration_ms=5000)
+
     def _build_ui(self) -> None:
+        if bool(getattr(self, "ui_v2_enabled", False)):
+            self._build_ui_v2()
+            return
         top = ttk.Frame(self.root)
         top.pack(fill="x", padx=8, pady=(8, 0))
         role_label = self.current_user.get("role", "")
@@ -11569,6 +12697,7 @@ class PacientiAIApp:
 
         self._build_patients_panel(left)
         self._build_right_panel(right)
+        self._build_global_status_bar()
 
     def _init_ui_compact_toolbar_styles(self) -> None:
         if bool(getattr(self, "_ui_compact_toolbar_styles_initialized", False)):
@@ -11602,7 +12731,8 @@ class PacientiAIApp:
     def _refresh_ui_compact_toolbar_status(self) -> None:
         if not hasattr(self, "ui_compact_status_var"):
             return
-        enabled = bool(getattr(self, "ui_compact_menus_enabled", True))
+        enabled = True
+        self.ui_compact_menus_enabled = True
         self.ui_compact_status_var.set(f"UI compact: {'ON' if enabled else 'OFF'}")
         if self.ui_compact_status_button is not None:
             try:
@@ -11622,39 +12752,28 @@ class PacientiAIApp:
     def toggle_ui_compact_from_toolbar(self) -> None:
         if not self._require_role("Toggle UI compact", "admin"):
             return
-        current = bool(getattr(self, "ui_compact_menus_enabled", True))
-        target = not current
-        decision = messagebox.askyesno(
-            "UI compact menus",
-            (
-                f"Schimbi UI compact pe {'ON' if target else 'OFF'}?\n\n"
-                "Setarea se salveaza imediat. Efectul complet se aplica dupa restart."
-            ),
-        )
-        if not decision:
-            return
-        self.ui_compact_menus_enabled = target
+        self.ui_compact_menus_enabled = True
         try:
-            self.db.set_setting("UI_COMPACT_MENUS_ENABLED", "1" if target else "0")
+            self.db.set_setting("UI_COMPACT_MENUS_ENABLED", "1")
         except Exception as exc:
             messagebox.showerror("UI compact menus", f"Nu am putut salva setarea.\n{exc}")
             return
         self._refresh_ui_compact_toolbar_status()
         if hasattr(self, "settings_bool_vars") and "UI_COMPACT_MENUS_ENABLED" in self.settings_bool_vars:
-            self.settings_bool_vars["UI_COMPACT_MENUS_ENABLED"].set(target)
+            self.settings_bool_vars["UI_COMPACT_MENUS_ENABLED"].set(True)
         if hasattr(self, "settings_hint_var"):
             self.settings_hint_var.set(
-                f"UI compact menus: {'ON' if target else 'OFF'}. Restart necesar pentru aplicare completa."
+                "UI compact menus este fortat pe ON pentru vizibilitate completa a actiunilor."
             )
         self._audit(
             "toggle_ui_compact_menus_toolbar",
-            self._audit_details_from_pairs(("value", "1" if target else "0")),
+            self._audit_details_from_pairs(("value", "1")),
         )
         messagebox.showinfo(
             "UI compact menus",
             (
-                f"Setarea a fost salvata: {'ON' if target else 'OFF'}.\n"
-                "Reporneste aplicatia pentru a vedea modificarea in toate tab-urile."
+                "UI compact menus este fortat pe ON pentru a preveni zone UI ascunse.\n"
+                "Setarea OFF nu mai este aplicata."
             ),
         )
 
@@ -11784,7 +12903,7 @@ class PacientiAIApp:
         self,
         parent: ttk.Frame,
         menu_label: str,
-        action_items: List[Dict[str, Any]],
+        action_items: List[ActionDescriptor],
         *,
         pack_side: str = LEFT,
         pack_padx: Any = 6,
@@ -11815,8 +12934,7 @@ class PacientiAIApp:
         menu_specs: List[Dict[str, Any]],
         source_frames: Optional[List[ttk.Frame]] = None,
     ) -> None:
-        if not bool(getattr(self, "ui_compact_menus_enabled", True)):
-            return
+        self.ui_compact_menus_enabled = True
         frames = source_frames or [parent]
         label_buckets: Dict[str, List[ttk.Button]] = {}
         for frame in frames:
@@ -11834,7 +12952,7 @@ class PacientiAIApp:
             if not menu_label or not entries:
                 continue
 
-            action_items: List[Dict[str, Any]] = []
+            action_items: List[ActionDescriptor] = []
             for entry in entries:
                 label = str(entry.get("label") or "").strip()
                 if not label:
@@ -11903,7 +13021,7 @@ class PacientiAIApp:
                 self.ui_compact_menus_checkbutton.focus_set()
             if hasattr(self, "settings_hint_var"):
                 self.settings_hint_var.set(
-                    "Toggle rapid: 'UI compact menus'. Dupa modificare, salveaza si restarteaza pentru efect complet."
+                    "UI compact menus este fortat pe ON pentru a evita actiuni ascunse la rezolutii mici."
                 )
         except Exception as exc:
             messagebox.showerror("Setari UI", f"Nu am putut deschide tab-ul Setari.\n{exc}")
@@ -12583,7 +13701,8 @@ class PacientiAIApp:
         ttk.Label(search_wrap, text="Cauta:").pack(side=LEFT)
         self.search_var = tk.StringVar()
         self.search_var.trace_add("write", lambda *_: self.refresh_patients())
-        ttk.Entry(search_wrap, textvariable=self.search_var).pack(side=LEFT, fill="x", expand=True, padx=(6, 0))
+        self.search_entry = ttk.Entry(search_wrap, textvariable=self.search_var)
+        self.search_entry.pack(side=LEFT, fill="x", expand=True, padx=(6, 0))
 
         filters_wrap = ttk.Frame(parent)
         filters_wrap.pack(fill="x", pady=(0, 8))
@@ -12646,8 +13765,21 @@ class PacientiAIApp:
         ttk.Button(btns, text="Reincarca", command=self.refresh_patients).pack(side=LEFT)
 
     def _build_right_panel(self, parent: ttk.Frame) -> None:
-        self.notebook = ttk.Notebook(parent)
+        notebook_parent: ttk.Frame = parent
+        self.ui_v2_tab_nav_wrap = None
+        if bool(getattr(self, "ui_v2_enabled", False)):
+            shell = ttk.Frame(parent)
+            shell.pack(fill=BOTH, expand=True)
+            nav_wrap = ttk.LabelFrame(shell, text="Navigare")
+            nav_wrap.pack(side=LEFT, fill="y", padx=(0, 8))
+            content_wrap = ttk.Frame(shell)
+            content_wrap.pack(side=LEFT, fill=BOTH, expand=True)
+            self.ui_v2_tab_nav_wrap = nav_wrap
+            notebook_parent = content_wrap
+
+        self.notebook = ttk.Notebook(notebook_parent)
         self.notebook.pack(fill=BOTH, expand=True)
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_notebook_tab_changed_v2)
 
         tab_dashboard = ttk.Frame(self.notebook)
         tab_stats = ttk.Frame(self.notebook)
@@ -12703,10 +13835,180 @@ class PacientiAIApp:
         if self._has_role("admin"):
             self._build_users_tab(tab_users)
             self._build_settings_tab(tab_settings)
+        if bool(getattr(self, "ui_v2_enabled", False)):
+            self._build_ui_v2_tab_navigator()
+
+    def _current_notebook_tab_key(self) -> str:
+        if not hasattr(self, "notebook") or self.notebook is None:
+            return ""
+        try:
+            tab_id = self.notebook.select()
+            tab_text = str(self.notebook.tab(tab_id, "text") or "").strip()
+        except Exception:
+            return ""
+        if not tab_text:
+            return ""
+        return self._ui_v2_tab_key_for_label(tab_text)
+
+    def _context_key_to_tab_key(self, context_key: str) -> str:
+        slug = self._action_key_slug(context_key)
+        ordered_tabs = sorted(UI_V2_TAB_DEFAULTS, key=lambda k: len(self._action_key_slug(k)), reverse=True)
+        for key in ordered_tabs:
+            tab_slug = self._action_key_slug(key)
+            if slug == tab_slug or slug.startswith(f"{tab_slug}_"):
+                return key
+        return "global"
+
+    def _register_overflow_palette_action(self, tab_key: str, label: str, callback: Callable[[], Any]) -> None:
+        key = str(tab_key or "global").strip() or "global"
+        text = str(label or "").strip()
+        if not text or not callable(callback):
+            return
+        bucket = self.overflow_palette_actions.setdefault(key, [])
+        norm = text.lower()
+        for item in bucket:
+            if str(item.get("label") or "").strip().lower() == norm:
+                return
+        bucket.append({"label": text, "action": callback})
+
+    def _make_scrollable_tab_container(self, parent: ttk.Frame, tab_key: str) -> ttk.Frame:
+        wrap = ttk.Frame(parent)
+        wrap.pack(fill=BOTH, expand=True)
+
+        canvas = tk.Canvas(wrap, highlightthickness=0, borderwidth=0)
+        y_scroll = ttk.Scrollbar(wrap, orient=VERTICAL, command=canvas.yview)
+        x_scroll = ttk.Scrollbar(wrap, orient=HORIZONTAL, command=canvas.xview)
+        canvas.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
+        canvas.pack(side=LEFT, fill=BOTH, expand=True)
+        y_scroll.pack(side=RIGHT, fill=Y)
+        x_scroll.pack(side="bottom", fill="x")
+
+        inner = ttk.Frame(canvas)
+        window_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+        container_id = f"{self._action_key_slug(tab_key)}_{len(self.scrollable_tab_registry) + 1}"
+
+        def _on_inner_configure(_event: Any = None) -> None:
+            try:
+                canvas.configure(scrollregion=canvas.bbox("all"))
+            except Exception:
+                pass
+
+        def _on_canvas_configure(event: Any) -> None:
+            try:
+                req_width = int(inner.winfo_reqwidth() or 0)
+                width = max(int(getattr(event, "width", 0) or 0), req_width)
+                canvas.itemconfigure(window_id, width=width)
+                canvas.configure(scrollregion=canvas.bbox("all"))
+            except Exception:
+                pass
+
+        inner.bind("<Configure>", _on_inner_configure)
+        canvas.bind("<Configure>", _on_canvas_configure)
+
+        self.scrollable_tab_registry[container_id] = {
+            "canvas": canvas,
+            "inner": inner,
+            "scrollbar": y_scroll,
+            "y_scrollbar": y_scroll,
+            "x_scrollbar": x_scroll,
+            "window_id": window_id,
+            "tab_key": tab_key,
+        }
+        self._bind_scrollable_tab_mousewheel(container_id)
+        return inner
+
+    def _bind_scrollable_tab_mousewheel(self, container_id: str) -> None:
+        info = self.scrollable_tab_registry.get(container_id) or {}
+        canvas = info.get("canvas")
+        inner = info.get("inner")
+        if not isinstance(canvas, tk.Canvas) or inner is None:
+            return
+
+        def _on_enter(_event: Any = None) -> None:
+            self.scrollable_tab_hovered_id = container_id
+
+        def _on_leave(_event: Any = None) -> None:
+            if self.scrollable_tab_hovered_id == container_id:
+                self.scrollable_tab_hovered_id = None
+
+        def _on_mousewheel(event: Any) -> str:
+            if self.scrollable_tab_hovered_id != container_id:
+                return "break"
+            delta = int(getattr(event, "delta", 0) or 0)
+            if delta:
+                units = -1 if delta > 0 else 1
+            else:
+                num = int(getattr(event, "num", 0) or 0)
+                if num == 4:
+                    units = -1
+                elif num == 5:
+                    units = 1
+                else:
+                    return "break"
+            state = int(getattr(event, "state", 0) or 0)
+            is_shift = bool(state & 0x0001)
+            try:
+                if is_shift:
+                    canvas.xview_scroll(units, "units")
+                else:
+                    canvas.yview_scroll(units, "units")
+            except Exception:
+                pass
+            return "break"
+
+        for widget in (canvas, inner):
+            widget.bind("<Enter>", _on_enter, add="+")
+            widget.bind("<Leave>", _on_leave, add="+")
+            widget.bind("<MouseWheel>", _on_mousewheel, add="+")
+            widget.bind("<Shift-MouseWheel>", _on_mousewheel, add="+")
+            widget.bind("<Button-4>", _on_mousewheel, add="+")
+            widget.bind("<Button-5>", _on_mousewheel, add="+")
+            widget.bind("<Shift-Button-4>", _on_mousewheel, add="+")
+            widget.bind("<Shift-Button-5>", _on_mousewheel, add="+")
+
+    def _install_action_overflow(
+        self,
+        parent: ttk.Frame,
+        context_key: str,
+        primary_labels: List[str],
+        overflow_menu_label: str = "More",
+    ) -> None:
+        primary_norm = {self._normalize_action_label(label) for label in primary_labels if str(label or "").strip()}
+        candidates: List[Tuple[str, ttk.Button]] = []
+        for widget in parent.winfo_children():
+            if not isinstance(widget, ttk.Button):
+                continue
+            label = str(widget.cget("text") or "").strip()
+            if not label:
+                continue
+            if self._normalize_action_label(label) in primary_norm:
+                continue
+            candidates.append((label, widget))
+        if not candidates:
+            return
+
+        entries = [{"label": label} for label, _ in candidates]
+        self._group_actions_into_menus(
+            parent=parent,
+            context_key=f"{context_key}_overflow",
+            menu_specs=[
+                {
+                    "menu_label": str(overflow_menu_label or "More").strip() or "More",
+                    "entries": entries,
+                }
+            ],
+        )
+        tab_key = self._context_key_to_tab_key(context_key)
+        for label, button in candidates:
+            self._register_overflow_palette_action(
+                tab_key,
+                f"Actiune rapida: {label}",
+                (lambda b=button: b.invoke()),
+            )
 
     def _build_dashboard_tab(self, parent: ttk.Frame) -> None:
-        frame = ttk.Frame(parent)
-        frame.pack(fill=BOTH, expand=True, padx=10, pady=10)
+        frame = self._make_scrollable_tab_container(parent, "dashboard")
+        frame.configure(padding=(10, 10, 10, 10))
 
         filters = ttk.Frame(frame)
         filters.pack(fill="x")
@@ -12770,6 +14072,12 @@ class PacientiAIApp:
                     ],
                 }
             ],
+        )
+        self._install_action_overflow(
+            parent=filters,
+            context_key="dashboard_actions",
+            primary_labels=["Refresh Dashboard", "Reset filtre", "Reset dashboard+istoric", "Snapshot Watchlist"],
+            overflow_menu_label="More",
         )
 
         kpi = ttk.LabelFrame(frame, text="Indicatori sectie")
@@ -13002,8 +14310,8 @@ class PacientiAIApp:
             self.watchlist_formula_var.set(text)
 
     def _build_statistics_tab(self, parent: ttk.Frame) -> None:
-        frame = ttk.Frame(parent)
-        frame.pack(fill=BOTH, expand=True, padx=10, pady=10)
+        frame = self._make_scrollable_tab_container(parent, "statistics")
+        frame.configure(padding=(10, 10, 10, 10))
 
         self.stats_filter_vars = {
             "department": tk.StringVar(value=str(getattr(self, "stats_filter_department_default", ""))),
@@ -13049,6 +14357,12 @@ class PacientiAIApp:
                     ],
                 }
             ],
+        )
+        self._install_action_overflow(
+            parent=actions,
+            context_key="statistics_actions",
+            primary_labels=["7 zile", "30 zile", "Refresh"],
+            overflow_menu_label="More",
         )
 
         kpi_wrap = ttk.LabelFrame(frame, text="Indicatori")
@@ -13185,8 +14499,8 @@ class PacientiAIApp:
         self.stats_watchlist_export_tree.pack(fill=BOTH, expand=True, padx=6, pady=(2, 6))
 
     def _build_partners_tab(self, parent: ttk.Frame) -> None:
-        frame = ttk.Frame(parent)
-        frame.pack(fill=BOTH, expand=True, padx=10, pady=10)
+        frame = self._make_scrollable_tab_container(parent, "partners")
+        frame.configure(padding=(10, 10, 10, 10))
 
         filters = ttk.Frame(frame)
         filters.pack(fill="x", pady=(0, 6))
@@ -13905,8 +15219,8 @@ class PacientiAIApp:
             self.cost_center_tree.focus(str(saved_id))
 
     def _build_users_tab(self, parent: ttk.Frame) -> None:
-        frame = ttk.Frame(parent)
-        frame.pack(fill=BOTH, expand=True, padx=10, pady=10)
+        frame = self._make_scrollable_tab_container(parent, "users")
+        frame.configure(padding=(10, 10, 10, 10))
 
         list_wrap = ttk.LabelFrame(frame, text="Utilizatori")
         list_wrap.pack(fill=BOTH, expand=True)
@@ -13974,16 +15288,29 @@ class PacientiAIApp:
                 }
             ],
         )
+        self._install_action_overflow(
+            parent=actions,
+            context_key="users_admin_actions",
+            primary_labels=["Creeaza utilizator", "Actualizeaza rol/stare"],
+            overflow_menu_label="More",
+        )
 
     def _build_settings_tab(self, parent: ttk.Frame) -> None:
-        frame = ttk.Frame(parent)
-        frame.pack(fill=BOTH, expand=True, padx=10, pady=10)
+        frame = self._make_scrollable_tab_container(parent, "settings")
+        frame.configure(padding=(10, 10, 10, 10))
 
         self.settings_bool_vars = {
             "ALERT_NOTIFY_ENABLED": tk.BooleanVar(value=self.notify_enabled),
             "AUTO_BACKUP_ENABLED": tk.BooleanVar(value=self.backup_enabled),
             "AI_ENABLED": tk.BooleanVar(value=self.ai_enabled),
-            "UI_COMPACT_MENUS_ENABLED": tk.BooleanVar(value=getattr(self, "ui_compact_menus_enabled", True)),
+            "UI_COMPACT_MENUS_ENABLED": tk.BooleanVar(value=True),
+            "UI_V2_ENABLED": tk.BooleanVar(value=True),
+            "UI_V2_ENABLE_COMMAND_PALETTE": tk.BooleanVar(
+                value=getattr(self, "ui_v2_enable_command_palette", True)
+            ),
+            "UI_V2_ENABLE_TOASTS": tk.BooleanVar(value=getattr(self, "ui_v2_enable_toasts", True)),
+            "UI_V2_ENABLE_GLASS_SURFACE": tk.BooleanVar(value=getattr(self, "ui_v2_enable_glass_surface", True)),
+            "UI_V2_ENABLE_ANIMATIONS": tk.BooleanVar(value=getattr(self, "ui_v2_enable_animations", True)),
             "DISCHARGE_REQUIRE_FINAL_DECONT": tk.BooleanVar(value=getattr(self, "discharge_require_final_decont", False)),
             "DISCHARGE_REQUIRE_SUMMARY": tk.BooleanVar(value=getattr(self, "discharge_require_summary", False)),
             "CASE_REQUIRE_SIUI_DRG_SUBMISSION": tk.BooleanVar(
@@ -14007,6 +15334,15 @@ class PacientiAIApp:
             "API_INTERNAL_ENABLED": tk.BooleanVar(value=getattr(self, "api_internal_enabled", False)),
             "API_INTERNAL_POSTGRES_SHADOW_ENABLED": tk.BooleanVar(
                 value=getattr(self, "api_internal_postgres_shadow_enabled", False)
+            ),
+            "API_INTERNAL_POSTGRES_PRIMARY_ENABLED": tk.BooleanVar(
+                value=getattr(self, "api_internal_postgres_primary_enabled", False)
+            ),
+            "API_INTERNAL_POSTGRES_REQUIRE_TLS": tk.BooleanVar(
+                value=getattr(self, "api_internal_postgres_require_tls", True)
+            ),
+            "API_INTERNAL_OFFLINE_SYNC_ENABLED": tk.BooleanVar(
+                value=getattr(self, "api_internal_offline_sync_enabled", True)
             ),
             "API_INTERNAL_USE_FOR_PATIENT_READ": tk.BooleanVar(
                 value=getattr(self, "api_internal_use_for_patient_read", False)
@@ -14066,6 +15402,14 @@ class PacientiAIApp:
             "AI_TEMPLATE_PLAN_24H": tk.StringVar(),
             "AI_TEMPLATE_DISCHARGE_DRAFT": tk.StringVar(),
             "AI_TEMPLATE_EXPLAIN_ALERT": tk.StringVar(),
+            "UI_V2_THEME": tk.StringVar(),
+            "UI_V2_VISUAL_STYLE": tk.StringVar(),
+            "UI_V2_CHROME_MODE": tk.StringVar(),
+            "UI_V2_DENSITY": tk.StringVar(),
+            "UI_V2_MOTION_PROFILE": tk.StringVar(),
+            "UI_V2_LAYOUT_PROFILE": tk.StringVar(),
+            "UI_V2_SCALE_PERCENT": tk.StringVar(),
+            "UI_V2_TAB_FLAGS_JSON": tk.StringVar(),
             "SIUI_DRG_BASE_URL": tk.StringVar(),
             "SIUI_DRG_ENDPOINT_SIUI_SUBMIT": tk.StringVar(),
             "SIUI_DRG_ENDPOINT_DRG_SUBMIT": tk.StringVar(),
@@ -14088,12 +15432,14 @@ class PacientiAIApp:
             "OBSERVABILITY_SAMPLE_RATIO": tk.StringVar(),
             "API_INTERNAL_BASE_URL": tk.StringVar(),
             "API_INTERNAL_TIMEOUT_SECONDS": tk.StringVar(),
+            "API_INTERNAL_DB_MODE": tk.StringVar(),
             "API_INTERNAL_DB_BACKEND": tk.StringVar(),
             "API_INTERNAL_POSTGRES_CONNECT_TIMEOUT_SECONDS": tk.StringVar(),
             "API_INTERNAL_POSTGRES_SHADOW_MAX_RETRIES": tk.StringVar(),
             "API_INTERNAL_POSTGRES_SHADOW_BATCH_SIZE": tk.StringVar(),
             "API_INTERNAL_POSTGRES_SHADOW_INTERVAL_SECONDS": tk.StringVar(),
             "API_INTERNAL_POSTGRES_SHADOW_STOP_ON_ERROR_RATE": tk.StringVar(),
+            "API_INTERNAL_OFFLINE_SYNC_BATCH_SIZE": tk.StringVar(),
             "ORG_LEGAL_NAME": tk.StringVar(),
             "ORG_FISCAL_CODE": tk.StringVar(),
             "ORG_DEFAULT_CURRENCY": tk.StringVar(),
@@ -14171,6 +15517,7 @@ class PacientiAIApp:
             variable=self.settings_bool_vars["UI_COMPACT_MENUS_ENABLED"],
         )
         self.ui_compact_menus_checkbutton.grid(row=5, column=0, columnspan=2, sticky="w", padx=6, pady=2)
+        self.ui_compact_menus_checkbutton.state(["disabled"])
 
         ops_fields_start_row = 6
         ops_fields = [
@@ -14474,6 +15821,113 @@ class PacientiAIApp:
         )
         ai_wrap.grid_columnconfigure(1, weight=1)
 
+        ui_v2_wrap = ttk.LabelFrame(frame, text="UI Modern V2 (feature flags)")
+        ui_v2_wrap.pack(fill="x", pady=(0, 8))
+        ui_v2_enabled_toggle = ttk.Checkbutton(
+            ui_v2_wrap,
+            text="UI V3 premium activ global (big-bang, compatibilitate fallback mentinuta)",
+            variable=self.settings_bool_vars["UI_V2_ENABLED"],
+        )
+        ui_v2_enabled_toggle.grid(row=0, column=0, columnspan=2, sticky="w", padx=6, pady=2)
+        ui_v2_enabled_toggle.state(["disabled"])
+        ttk.Checkbutton(
+            ui_v2_wrap,
+            text="Enable Command Palette (Ctrl+K)",
+            variable=self.settings_bool_vars["UI_V2_ENABLE_COMMAND_PALETTE"],
+        ).grid(row=1, column=0, columnspan=2, sticky="w", padx=6, pady=2)
+        ttk.Checkbutton(
+            ui_v2_wrap,
+            text="Enable toasts (inlocuieste showinfo cu status inline)",
+            variable=self.settings_bool_vars["UI_V2_ENABLE_TOASTS"],
+        ).grid(row=2, column=0, columnspan=2, sticky="w", padx=6, pady=2)
+        ttk.Checkbutton(
+            ui_v2_wrap,
+            text="Activeaza glass surface (premium background stratificat)",
+            variable=self.settings_bool_vars["UI_V2_ENABLE_GLASS_SURFACE"],
+        ).grid(row=3, column=0, columnspan=2, sticky="w", padx=6, pady=2)
+        ttk.Checkbutton(
+            ui_v2_wrap,
+            text="Activeaza animatii UI V2",
+            variable=self.settings_bool_vars["UI_V2_ENABLE_ANIMATIONS"],
+        ).grid(row=4, column=0, columnspan=2, sticky="w", padx=6, pady=2)
+        ttk.Label(ui_v2_wrap, text="Tema V2").grid(row=5, column=0, sticky="w", padx=6, pady=3)
+        ttk.Combobox(
+            ui_v2_wrap,
+            textvariable=self.settings_text_vars["UI_V2_THEME"],
+            values=("system", "light", "dark"),
+            state="readonly",
+            width=24,
+        ).grid(row=5, column=1, sticky="w", padx=6, pady=3)
+        ttk.Label(ui_v2_wrap, text="Stil vizual").grid(row=6, column=0, sticky="w", padx=6, pady=3)
+        ttk.Combobox(
+            ui_v2_wrap,
+            textvariable=self.settings_text_vars["UI_V2_VISUAL_STYLE"],
+            values=("premium", "classic"),
+            state="readonly",
+            width=24,
+        ).grid(row=6, column=1, sticky="w", padx=6, pady=3)
+        ttk.Label(ui_v2_wrap, text="Chrome mode").grid(row=7, column=0, sticky="w", padx=6, pady=3)
+        ttk.Combobox(
+            ui_v2_wrap,
+            textvariable=self.settings_text_vars["UI_V2_CHROME_MODE"],
+            values=("modern", "legacy"),
+            state="readonly",
+            width=24,
+        ).grid(row=7, column=1, sticky="w", padx=6, pady=3)
+        ttk.Label(ui_v2_wrap, text="Densitate").grid(row=8, column=0, sticky="w", padx=6, pady=3)
+        ttk.Combobox(
+            ui_v2_wrap,
+            textvariable=self.settings_text_vars["UI_V2_DENSITY"],
+            values=("compact", "comfortable"),
+            state="readonly",
+            width=24,
+        ).grid(row=8, column=1, sticky="w", padx=6, pady=3)
+        ttk.Label(ui_v2_wrap, text="Motion profile").grid(row=9, column=0, sticky="w", padx=6, pady=3)
+        ttk.Combobox(
+            ui_v2_wrap,
+            textvariable=self.settings_text_vars["UI_V2_MOTION_PROFILE"],
+            values=("low", "balanced", "max"),
+            state="readonly",
+            width=24,
+        ).grid(row=9, column=1, sticky="w", padx=6, pady=3)
+        ttk.Label(ui_v2_wrap, text="Layout profile").grid(row=10, column=0, sticky="w", padx=6, pady=3)
+        ttk.Combobox(
+            ui_v2_wrap,
+            textvariable=self.settings_text_vars["UI_V2_LAYOUT_PROFILE"],
+            values=("premium_glass_clinic",),
+            state="readonly",
+            width=24,
+        ).grid(row=10, column=1, sticky="w", padx=6, pady=3)
+        ttk.Label(ui_v2_wrap, text="Scale UI (%)").grid(row=11, column=0, sticky="w", padx=6, pady=3)
+        ttk.Entry(ui_v2_wrap, textvariable=self.settings_text_vars["UI_V2_SCALE_PERCENT"], width=12).grid(
+            row=11,
+            column=1,
+            sticky="w",
+            padx=6,
+            pady=3,
+        )
+        ttk.Label(ui_v2_wrap, text="Tab flags JSON (fortat ON pentru toate tab-urile)").grid(
+            row=12, column=0, sticky="w", padx=6, pady=3
+        )
+        ttk.Entry(ui_v2_wrap, textvariable=self.settings_text_vars["UI_V2_TAB_FLAGS_JSON"], width=56).grid(
+            row=12,
+            column=1,
+            sticky="ew",
+            padx=6,
+            pady=3,
+        )
+        ttk.Label(
+            ui_v2_wrap,
+            text=(
+                "Exemplu JSON: {\"dashboard\": true, \"admissions\": true, \"audit\": false}. "
+                "La salvare big-bang, toate cheile sunt normalizate automat la true."
+            ),
+            foreground="#475569",
+            wraplength=980,
+            justify="left",
+        ).grid(row=13, column=0, columnspan=2, sticky="w", padx=6, pady=(3, 4))
+        ui_v2_wrap.grid_columnconfigure(1, weight=1)
+
         live_wrap = ttk.LabelFrame(frame, text="Integrari live (REST JSON)")
         live_wrap.pack(fill="x", pady=(0, 8))
         ttk.Checkbutton(
@@ -14577,32 +16031,63 @@ class PacientiAIApp:
         ).grid(row=1, column=0, columnspan=2, sticky="w", padx=6, pady=2)
         ttk.Checkbutton(
             api_wrap,
+            text="Activeaza Postgres primary mode (pregatire cutover, admin-only)",
+            variable=self.settings_bool_vars["API_INTERNAL_POSTGRES_PRIMARY_ENABLED"],
+        ).grid(row=2, column=0, columnspan=2, sticky="w", padx=6, pady=2)
+        ttk.Checkbutton(
+            api_wrap,
+            text="Impune TLS la conectarea Postgres",
+            variable=self.settings_bool_vars["API_INTERNAL_POSTGRES_REQUIRE_TLS"],
+        ).grid(row=3, column=0, columnspan=2, sticky="w", padx=6, pady=2)
+        ttk.Checkbutton(
+            api_wrap,
+            text="Activeaza sincronizare offline desktop->API",
+            variable=self.settings_bool_vars["API_INTERNAL_OFFLINE_SYNC_ENABLED"],
+        ).grid(row=4, column=0, columnspan=2, sticky="w", padx=6, pady=2)
+        ttk.Checkbutton(
+            api_wrap,
             text="Foloseste API intern pentru citire pacient selectat (doar localhost)",
             variable=self.settings_bool_vars["API_INTERNAL_USE_FOR_PATIENT_READ"],
-        ).grid(row=2, column=0, columnspan=2, sticky="w", padx=6, pady=2)
+        ).grid(row=5, column=0, columnspan=2, sticky="w", padx=6, pady=2)
         ttk.Checkbutton(
             api_wrap,
             text="Foloseste API intern pentru sugestii diagnostice + estimare DRG/ICM",
             variable=self.settings_bool_vars["API_INTERNAL_USE_FOR_DIAGNOSIS"],
-        ).grid(row=3, column=0, columnspan=2, sticky="w", padx=6, pady=2)
+        ).grid(row=6, column=0, columnspan=2, sticky="w", padx=6, pady=2)
         ttk.Checkbutton(
             api_wrap,
             text="Foloseste API intern pentru create/update pacient (doar localhost)",
             variable=self.settings_bool_vars["API_INTERNAL_USE_FOR_PATIENT_WRITE"],
-        ).grid(row=4, column=0, columnspan=2, sticky="w", padx=6, pady=2)
+        ).grid(row=7, column=0, columnspan=2, sticky="w", padx=6, pady=2)
         api_fields = [
             ("API_INTERNAL_BASE_URL", "API base URL (ex: http://127.0.0.1:8000)"),
             ("API_INTERNAL_TIMEOUT_SECONDS", "API timeout (sec)"),
+            ("API_INTERNAL_DB_MODE", "Mod DB API (sqlite | shadow | postgres_primary)"),
             ("API_INTERNAL_DB_BACKEND", "Backend API (sqlite | postgres)"),
             ("API_INTERNAL_POSTGRES_CONNECT_TIMEOUT_SECONDS", "Postgres connect timeout (sec)"),
             ("API_INTERNAL_POSTGRES_SHADOW_MAX_RETRIES", "Shadow max retries"),
             ("API_INTERNAL_POSTGRES_SHADOW_BATCH_SIZE", "Shadow batch size"),
             ("API_INTERNAL_POSTGRES_SHADOW_INTERVAL_SECONDS", "Shadow interval (sec)"),
             ("API_INTERNAL_POSTGRES_SHADOW_STOP_ON_ERROR_RATE", "Shadow stop on error rate (0..1)"),
+            ("API_INTERNAL_OFFLINE_SYNC_BATCH_SIZE", "Offline sync batch size"),
         ]
-        for idx, (key, label_text) in enumerate(api_fields, start=5):
+        for idx, (key, label_text) in enumerate(api_fields, start=8):
             ttk.Label(api_wrap, text=label_text).grid(row=idx, column=0, sticky="w", padx=6, pady=3)
-            if key == "API_INTERNAL_DB_BACKEND":
+            if key == "API_INTERNAL_DB_MODE":
+                ttk.Combobox(
+                    api_wrap,
+                    textvariable=self.settings_text_vars[key],
+                    values=("sqlite", "shadow", "postgres_primary"),
+                    state="readonly",
+                    width=28,
+                ).grid(
+                    row=idx,
+                    column=1,
+                    sticky="w",
+                    padx=6,
+                    pady=3,
+                )
+            elif key == "API_INTERNAL_DB_BACKEND":
                 ttk.Combobox(
                     api_wrap,
                     textvariable=self.settings_text_vars[key],
@@ -14634,7 +16119,7 @@ class PacientiAIApp:
             foreground="#475569",
             wraplength=980,
             justify="left",
-        ).grid(row=5 + len(api_fields), column=0, columnspan=2, sticky="w", padx=6, pady=(3, 4))
+        ).grid(row=8 + len(api_fields), column=0, columnspan=2, sticky="w", padx=6, pady=(3, 4))
         api_wrap.grid_columnconfigure(1, weight=1)
 
         actions = ttk.Frame(frame)
@@ -14682,6 +16167,22 @@ class PacientiAIApp:
             side=LEFT,
             padx=6,
         )
+        ttk.Button(actions, text="Vezi status DB mode", command=self.show_db_mode_status_popup).pack(
+            side=LEFT,
+            padx=6,
+        )
+        ttk.Button(actions, text="Ruleaza reconciliere", command=self.run_reconciliation_now).pack(
+            side=LEFT,
+            padx=6,
+        )
+        ttk.Button(actions, text="Vezi reconciliere", command=self.show_reconciliation_status_popup).pack(
+            side=LEFT,
+            padx=6,
+        )
+        ttk.Button(actions, text="Heartbeat statii", command=self.show_station_heartbeats_popup).pack(
+            side=LEFT,
+            padx=6,
+        )
         ttk.Button(actions, text="Ruleaza dry-run integrari", command=self.run_integration_dry_run_now).pack(
             side=LEFT,
             padx=6,
@@ -14711,12 +16212,22 @@ class PacientiAIApp:
                         {"label": "Proceseaza shadow sync acum"},
                         {"label": "Vezi erori shadow sync"},
                         {"label": "Vezi status shadow sync"},
+                        {"label": "Vezi status DB mode"},
+                        {"label": "Ruleaza reconciliere"},
+                        {"label": "Vezi reconciliere"},
+                        {"label": "Heartbeat statii"},
                         {"label": "Ruleaza dry-run integrari"},
                         {"label": "Vezi loguri dry-run"},
                         {"label": "Testeaza health API"},
                     ],
                 }
             ],
+        )
+        self._install_action_overflow(
+            parent=actions,
+            context_key="settings_actions",
+            primary_labels=["Reincarca din DB", "Salveaza setari", "Salveaza fara aplicare"],
+            overflow_menu_label="More",
         )
 
         self.settings_hint_var = tk.StringVar(value="Setari runtime pentru notificari, backup si securitate login.")
@@ -14792,6 +16303,18 @@ class PacientiAIApp:
                 "AI_TEMPLATE_EXPLAIN_ALERT",
                 "Explica alerta vitala recenta si impactul clinic imediat.",
             ),
+            "UI_V2_THEME": getattr(self, "ui_v2_theme", "system"),
+            "UI_V2_VISUAL_STYLE": getattr(self, "ui_v2_visual_style", "premium"),
+            "UI_V2_CHROME_MODE": getattr(self, "ui_v2_chrome_mode", "modern"),
+            "UI_V2_DENSITY": getattr(self, "ui_v2_density", "comfortable"),
+            "UI_V2_MOTION_PROFILE": getattr(self, "ui_v2_motion_profile", "max"),
+            "UI_V2_LAYOUT_PROFILE": getattr(self, "ui_v2_layout_profile", "premium_glass_clinic"),
+            "UI_V2_SCALE_PERCENT": str(getattr(self, "ui_v2_scale_percent", 100)),
+            "UI_V2_TAB_FLAGS_JSON": json.dumps(
+                self._normalize_ui_v2_tab_flags_big_bang(getattr(self, "ui_v2_tab_flags_json", "")),
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
             "SIUI_DRG_BASE_URL": getattr(self, "siui_drg_base_url", ""),
             "SIUI_DRG_ENDPOINT_SIUI_SUBMIT": getattr(self, "siui_drg_endpoint_siui_submit", "/siui/submit"),
             "SIUI_DRG_ENDPOINT_DRG_SUBMIT": getattr(self, "siui_drg_endpoint_drg_submit", "/drg/submit"),
@@ -14814,6 +16337,7 @@ class PacientiAIApp:
             "OBSERVABILITY_SAMPLE_RATIO": str(getattr(self, "observability_sample_ratio", 1.0)),
             "API_INTERNAL_BASE_URL": getattr(self, "api_internal_base_url", "http://127.0.0.1:8000"),
             "API_INTERNAL_TIMEOUT_SECONDS": str(getattr(self, "api_internal_timeout_seconds", 8)),
+            "API_INTERNAL_DB_MODE": getattr(self, "api_internal_db_mode", "sqlite"),
             "API_INTERNAL_DB_BACKEND": getattr(self, "api_internal_db_backend", "sqlite"),
             "API_INTERNAL_POSTGRES_CONNECT_TIMEOUT_SECONDS": str(
                 getattr(self, "api_internal_postgres_connect_timeout_seconds", 2)
@@ -14830,6 +16354,9 @@ class PacientiAIApp:
             "API_INTERNAL_POSTGRES_SHADOW_STOP_ON_ERROR_RATE": str(
                 getattr(self, "api_internal_postgres_shadow_stop_on_error_rate", 0.5)
             ),
+            "API_INTERNAL_OFFLINE_SYNC_BATCH_SIZE": str(
+                getattr(self, "api_internal_offline_sync_batch_size", 100)
+            ),
             "ORG_LEGAL_NAME": getattr(self, "org_legal_name", DEFAULT_HOSPITAL_NAME),
             "ORG_FISCAL_CODE": getattr(self, "org_fiscal_code", ""),
             "ORG_DEFAULT_CURRENCY": getattr(self, "org_default_currency", "RON"),
@@ -14841,6 +16368,19 @@ class PacientiAIApp:
         saved = self.db.get_settings(list(defaults.keys()))
         for key, var in self.settings_text_vars.items():
             var.set(saved.get(key, defaults.get(key, "")))
+        normalized_motion = normalize_ui_v2_motion_profile(self.settings_text_vars["UI_V2_MOTION_PROFILE"].get(), "max")
+        normalized_layout = normalize_ui_v2_layout_profile(
+            self.settings_text_vars["UI_V2_LAYOUT_PROFILE"].get(),
+            "premium_glass_clinic",
+        )
+        normalized_flags_text = json.dumps(
+            self._normalize_ui_v2_tab_flags_big_bang(self.settings_text_vars["UI_V2_TAB_FLAGS_JSON"].get()),
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        self.settings_text_vars["UI_V2_MOTION_PROFILE"].set(normalized_motion)
+        self.settings_text_vars["UI_V2_LAYOUT_PROFILE"].set(normalized_layout)
+        self.settings_text_vars["UI_V2_TAB_FLAGS_JSON"].set(normalized_flags_text)
 
         bool_saved_notify = self.db.get_setting("ALERT_NOTIFY_ENABLED", "1" if self.notify_enabled else "0")
         bool_saved_backup = self.db.get_setting("AUTO_BACKUP_ENABLED", "1" if self.backup_enabled else "0")
@@ -14881,6 +16421,26 @@ class PacientiAIApp:
             "UI_COMPACT_MENUS_ENABLED",
             "1" if getattr(self, "ui_compact_menus_enabled", True) else "0",
         )
+        bool_saved_ui_v2_enabled = self.db.get_setting(
+            "UI_V2_ENABLED",
+            "1" if getattr(self, "ui_v2_enabled", False) else "0",
+        )
+        bool_saved_ui_v2_command_palette = self.db.get_setting(
+            "UI_V2_ENABLE_COMMAND_PALETTE",
+            "1" if getattr(self, "ui_v2_enable_command_palette", True) else "0",
+        )
+        bool_saved_ui_v2_toasts = self.db.get_setting(
+            "UI_V2_ENABLE_TOASTS",
+            "1" if getattr(self, "ui_v2_enable_toasts", True) else "0",
+        )
+        bool_saved_ui_v2_glass = self.db.get_setting(
+            "UI_V2_ENABLE_GLASS_SURFACE",
+            "1" if getattr(self, "ui_v2_enable_glass_surface", True) else "0",
+        )
+        bool_saved_ui_v2_animations = self.db.get_setting(
+            "UI_V2_ENABLE_ANIMATIONS",
+            "1" if getattr(self, "ui_v2_enable_animations", True) else "0",
+        )
         bool_saved_docnum_auto = self.db.get_setting(
             "DOCNUM_ENABLE_AUTO",
             "1" if getattr(self, "docnum_enable_auto", False) else "0",
@@ -14905,6 +16465,18 @@ class PacientiAIApp:
             "API_INTERNAL_POSTGRES_SHADOW_ENABLED",
             "1" if getattr(self, "api_internal_postgres_shadow_enabled", False) else "0",
         )
+        bool_saved_api_internal_primary_enabled = self.db.get_setting(
+            "API_INTERNAL_POSTGRES_PRIMARY_ENABLED",
+            "1" if getattr(self, "api_internal_postgres_primary_enabled", False) else "0",
+        )
+        bool_saved_api_internal_require_tls = self.db.get_setting(
+            "API_INTERNAL_POSTGRES_REQUIRE_TLS",
+            "1" if getattr(self, "api_internal_postgres_require_tls", True) else "0",
+        )
+        bool_saved_api_internal_offline_sync_enabled = self.db.get_setting(
+            "API_INTERNAL_OFFLINE_SYNC_ENABLED",
+            "1" if getattr(self, "api_internal_offline_sync_enabled", True) else "0",
+        )
         bool_saved_api_internal_read = self.db.get_setting(
             "API_INTERNAL_USE_FOR_PATIENT_READ",
             "1" if getattr(self, "api_internal_use_for_patient_read", False) else "0",
@@ -14920,8 +16492,19 @@ class PacientiAIApp:
         self.settings_bool_vars["ALERT_NOTIFY_ENABLED"].set(self._to_bool(bool_saved_notify, True))
         self.settings_bool_vars["AUTO_BACKUP_ENABLED"].set(self._to_bool(bool_saved_backup, True))
         self.settings_bool_vars["AI_ENABLED"].set(self._to_bool(bool_saved_ai, True))
-        self.settings_bool_vars["UI_COMPACT_MENUS_ENABLED"].set(
-            self._to_bool(bool_saved_ui_compact_menus, True)
+        self.settings_bool_vars["UI_COMPACT_MENUS_ENABLED"].set(True)
+        self.settings_bool_vars["UI_V2_ENABLED"].set(True)
+        self.settings_bool_vars["UI_V2_ENABLE_COMMAND_PALETTE"].set(
+            self._to_bool(bool_saved_ui_v2_command_palette, True)
+        )
+        self.settings_bool_vars["UI_V2_ENABLE_TOASTS"].set(
+            self._to_bool(bool_saved_ui_v2_toasts, True)
+        )
+        self.settings_bool_vars["UI_V2_ENABLE_GLASS_SURFACE"].set(
+            self._to_bool(bool_saved_ui_v2_glass, True)
+        )
+        self.settings_bool_vars["UI_V2_ENABLE_ANIMATIONS"].set(
+            self._to_bool(bool_saved_ui_v2_animations, True)
         )
         self.settings_bool_vars["DISCHARGE_REQUIRE_FINAL_DECONT"].set(
             self._to_bool(bool_saved_discharge_decont, False)
@@ -14964,6 +16547,15 @@ class PacientiAIApp:
         )
         self.settings_bool_vars["API_INTERNAL_POSTGRES_SHADOW_ENABLED"].set(
             self._to_bool(bool_saved_api_internal_shadow_enabled, False)
+        )
+        self.settings_bool_vars["API_INTERNAL_POSTGRES_PRIMARY_ENABLED"].set(
+            self._to_bool(bool_saved_api_internal_primary_enabled, False)
+        )
+        self.settings_bool_vars["API_INTERNAL_POSTGRES_REQUIRE_TLS"].set(
+            self._to_bool(bool_saved_api_internal_require_tls, True)
+        )
+        self.settings_bool_vars["API_INTERNAL_OFFLINE_SYNC_ENABLED"].set(
+            self._to_bool(bool_saved_api_internal_offline_sync_enabled, True)
         )
         self.settings_bool_vars["API_INTERNAL_USE_FOR_PATIENT_READ"].set(
             self._to_bool(bool_saved_api_internal_read, False)
@@ -15115,13 +16707,26 @@ class PacientiAIApp:
             "API_INTERNAL_POSTGRES_SHADOW_MAX_RETRIES": 0,
             "API_INTERNAL_POSTGRES_SHADOW_BATCH_SIZE": 1,
             "API_INTERNAL_POSTGRES_SHADOW_INTERVAL_SECONDS": 5,
+            "API_INTERNAL_OFFLINE_SYNC_BATCH_SIZE": 1,
+            "UI_V2_SCALE_PERCENT": 90,
         }
 
         payload: Dict[str, Any] = {
             "ALERT_NOTIFY_ENABLED": "1" if self.settings_bool_vars["ALERT_NOTIFY_ENABLED"].get() else "0",
             "AUTO_BACKUP_ENABLED": "1" if self.settings_bool_vars["AUTO_BACKUP_ENABLED"].get() else "0",
             "AI_ENABLED": "1" if self.settings_bool_vars["AI_ENABLED"].get() else "0",
-            "UI_COMPACT_MENUS_ENABLED": "1" if self.settings_bool_vars["UI_COMPACT_MENUS_ENABLED"].get() else "0",
+            "UI_COMPACT_MENUS_ENABLED": "1",
+            "UI_V2_ENABLED": "1",
+            "UI_V2_ENABLE_COMMAND_PALETTE": "1"
+            if self.settings_bool_vars["UI_V2_ENABLE_COMMAND_PALETTE"].get()
+            else "0",
+            "UI_V2_ENABLE_TOASTS": "1" if self.settings_bool_vars["UI_V2_ENABLE_TOASTS"].get() else "0",
+            "UI_V2_ENABLE_GLASS_SURFACE": "1"
+            if self.settings_bool_vars["UI_V2_ENABLE_GLASS_SURFACE"].get()
+            else "0",
+            "UI_V2_ENABLE_ANIMATIONS": "1"
+            if self.settings_bool_vars["UI_V2_ENABLE_ANIMATIONS"].get()
+            else "0",
             "DISCHARGE_REQUIRE_FINAL_DECONT": "1" if self.settings_bool_vars["DISCHARGE_REQUIRE_FINAL_DECONT"].get() else "0",
             "DISCHARGE_REQUIRE_SUMMARY": "1" if self.settings_bool_vars["DISCHARGE_REQUIRE_SUMMARY"].get() else "0",
             "CASE_REQUIRE_SIUI_DRG_SUBMISSION": "1"
@@ -15145,6 +16750,15 @@ class PacientiAIApp:
             "API_INTERNAL_ENABLED": "1" if self.settings_bool_vars["API_INTERNAL_ENABLED"].get() else "0",
             "API_INTERNAL_POSTGRES_SHADOW_ENABLED": "1"
             if self.settings_bool_vars["API_INTERNAL_POSTGRES_SHADOW_ENABLED"].get()
+            else "0",
+            "API_INTERNAL_POSTGRES_PRIMARY_ENABLED": "1"
+            if self.settings_bool_vars["API_INTERNAL_POSTGRES_PRIMARY_ENABLED"].get()
+            else "0",
+            "API_INTERNAL_POSTGRES_REQUIRE_TLS": "1"
+            if self.settings_bool_vars["API_INTERNAL_POSTGRES_REQUIRE_TLS"].get()
+            else "0",
+            "API_INTERNAL_OFFLINE_SYNC_ENABLED": "1"
+            if self.settings_bool_vars["API_INTERNAL_OFFLINE_SYNC_ENABLED"].get()
             else "0",
             "API_INTERNAL_USE_FOR_PATIENT_READ": "1"
             if self.settings_bool_vars["API_INTERNAL_USE_FOR_PATIENT_READ"].get()
@@ -15267,12 +16881,91 @@ class PacientiAIApp:
             payload["API_INTERNAL_BASE_URL"] = api_base_url.rstrip("/")
             self.settings_text_vars["API_INTERNAL_BASE_URL"].set(payload["API_INTERNAL_BASE_URL"])
 
+        api_mode_default = "shadow" if self.settings_bool_vars["API_INTERNAL_POSTGRES_SHADOW_ENABLED"].get() else "sqlite"
+        api_db_mode = str(payload.get("API_INTERNAL_DB_MODE", api_mode_default) or api_mode_default).strip().lower() or api_mode_default
+        if api_db_mode not in {"sqlite", "shadow", "postgres_primary"}:
+            messagebox.showerror("Setari", "API_INTERNAL_DB_MODE accepta doar sqlite | shadow | postgres_primary.")
+            return
+        payload["API_INTERNAL_DB_MODE"] = api_db_mode
+        self.settings_text_vars["API_INTERNAL_DB_MODE"].set(api_db_mode)
+        if api_db_mode == "postgres_primary":
+            payload["API_INTERNAL_DB_BACKEND"] = "postgres"
+            payload["API_INTERNAL_POSTGRES_PRIMARY_ENABLED"] = "1"
+            payload["API_INTERNAL_POSTGRES_SHADOW_ENABLED"] = "0"
+            self.settings_bool_vars["API_INTERNAL_POSTGRES_PRIMARY_ENABLED"].set(True)
+            self.settings_bool_vars["API_INTERNAL_POSTGRES_SHADOW_ENABLED"].set(False)
+        elif api_db_mode == "shadow":
+            payload["API_INTERNAL_DB_BACKEND"] = "sqlite"
+            payload["API_INTERNAL_POSTGRES_PRIMARY_ENABLED"] = "0"
+            payload["API_INTERNAL_POSTGRES_SHADOW_ENABLED"] = "1"
+            self.settings_bool_vars["API_INTERNAL_POSTGRES_PRIMARY_ENABLED"].set(False)
+            self.settings_bool_vars["API_INTERNAL_POSTGRES_SHADOW_ENABLED"].set(True)
+        else:
+            payload["API_INTERNAL_DB_BACKEND"] = "sqlite"
+            payload["API_INTERNAL_POSTGRES_PRIMARY_ENABLED"] = "0"
+            payload["API_INTERNAL_POSTGRES_SHADOW_ENABLED"] = "0"
+            self.settings_bool_vars["API_INTERNAL_POSTGRES_PRIMARY_ENABLED"].set(False)
+            self.settings_bool_vars["API_INTERNAL_POSTGRES_SHADOW_ENABLED"].set(False)
+
         api_backend = str(payload.get("API_INTERNAL_DB_BACKEND", "sqlite") or "sqlite").strip().lower() or "sqlite"
         if api_backend not in {"sqlite", "postgres"}:
             messagebox.showerror("Setari", "API_INTERNAL_DB_BACKEND accepta doar sqlite | postgres.")
             return
         payload["API_INTERNAL_DB_BACKEND"] = api_backend
         self.settings_text_vars["API_INTERNAL_DB_BACKEND"].set(api_backend)
+
+        ui_v2_theme = normalize_ui_v2_theme(str(payload.get("UI_V2_THEME", "system") or "system"), "system")
+        ui_v2_visual_style = normalize_ui_v2_visual_style(
+            str(payload.get("UI_V2_VISUAL_STYLE", "premium") or "premium"),
+            "premium",
+        )
+        ui_v2_chrome_mode = normalize_ui_v2_chrome_mode(
+            str(payload.get("UI_V2_CHROME_MODE", "modern") or "modern"),
+            "modern",
+        )
+        ui_v2_density = normalize_ui_v2_density(
+            str(payload.get("UI_V2_DENSITY", "comfortable") or "comfortable"),
+            "comfortable",
+        )
+        ui_v2_motion_profile = normalize_ui_v2_motion_profile(
+            str(payload.get("UI_V2_MOTION_PROFILE", "max") or "max"),
+            "max",
+        )
+        ui_v2_layout_profile = normalize_ui_v2_layout_profile(
+            str(payload.get("UI_V2_LAYOUT_PROFILE", "premium_glass_clinic") or "premium_glass_clinic"),
+            "premium_glass_clinic",
+        )
+        ui_v2_scale = normalize_ui_v2_scale_percent(str(payload.get("UI_V2_SCALE_PERCENT", "100") or "100"), 100)
+        ui_v2_tab_flags_text = str(payload.get("UI_V2_TAB_FLAGS_JSON", "") or "").strip()
+        if ui_v2_tab_flags_text:
+            try:
+                loaded_flags = json.loads(ui_v2_tab_flags_text)
+            except Exception:
+                messagebox.showerror("Setari", "UI_V2_TAB_FLAGS_JSON trebuie sa fie JSON valid (obiect).")
+                return
+            if not isinstance(loaded_flags, dict):
+                messagebox.showerror("Setari", "UI_V2_TAB_FLAGS_JSON trebuie sa fie obiect JSON cu perechi tab->bool.")
+                return
+        normalized_flags = self._normalize_ui_v2_tab_flags_big_bang(ui_v2_tab_flags_text)
+        ui_v2_tab_flags_text = json.dumps(normalized_flags, ensure_ascii=False, sort_keys=True)
+        payload["UI_V2_ENABLED"] = "1"
+        payload["UI_V2_THEME"] = ui_v2_theme
+        payload["UI_V2_VISUAL_STYLE"] = ui_v2_visual_style
+        payload["UI_V2_CHROME_MODE"] = ui_v2_chrome_mode
+        payload["UI_V2_DENSITY"] = ui_v2_density
+        payload["UI_V2_MOTION_PROFILE"] = ui_v2_motion_profile
+        payload["UI_V2_LAYOUT_PROFILE"] = ui_v2_layout_profile
+        payload["UI_V2_SCALE_PERCENT"] = str(ui_v2_scale)
+        payload["UI_V2_TAB_FLAGS_JSON"] = ui_v2_tab_flags_text
+        self.settings_bool_vars["UI_V2_ENABLED"].set(True)
+        self.settings_text_vars["UI_V2_THEME"].set(ui_v2_theme)
+        self.settings_text_vars["UI_V2_VISUAL_STYLE"].set(ui_v2_visual_style)
+        self.settings_text_vars["UI_V2_CHROME_MODE"].set(ui_v2_chrome_mode)
+        self.settings_text_vars["UI_V2_DENSITY"].set(ui_v2_density)
+        self.settings_text_vars["UI_V2_MOTION_PROFILE"].set(ui_v2_motion_profile)
+        self.settings_text_vars["UI_V2_LAYOUT_PROFILE"].set(ui_v2_layout_profile)
+        self.settings_text_vars["UI_V2_SCALE_PERCENT"].set(str(ui_v2_scale))
+        self.settings_text_vars["UI_V2_TAB_FLAGS_JSON"].set(ui_v2_tab_flags_text)
 
         selected_model = (payload.get("OPENAI_MODEL", "") or "").strip() or DEFAULT_MODEL
         payload["OPENAI_MODEL"] = selected_model
@@ -15326,10 +17019,27 @@ class PacientiAIApp:
             self._audit_details_from_pairs(("keys", ",".join(sorted(payload.keys())))),
         )
         previous_ui_compact = bool(getattr(self, "ui_compact_menus_enabled", True))
-        requested_ui_compact = bool(self.settings_bool_vars["UI_COMPACT_MENUS_ENABLED"].get())
+        requested_ui_compact = True
+        previous_ui_v2_enabled = bool(getattr(self, "ui_v2_enabled", False))
+        requested_ui_v2_enabled = True
+        previous_ui_v2_theme = str(getattr(self, "ui_v2_theme", "system"))
+        requested_ui_v2_theme = str(payload.get("UI_V2_THEME", previous_ui_v2_theme))
+        previous_ui_v2_visual_style = str(getattr(self, "ui_v2_visual_style", "premium"))
+        requested_ui_v2_visual_style = str(payload.get("UI_V2_VISUAL_STYLE", previous_ui_v2_visual_style))
+        previous_ui_v2_chrome_mode = str(getattr(self, "ui_v2_chrome_mode", "modern"))
+        requested_ui_v2_chrome_mode = str(payload.get("UI_V2_CHROME_MODE", previous_ui_v2_chrome_mode))
+        previous_ui_v2_density = str(getattr(self, "ui_v2_density", "comfortable"))
+        requested_ui_v2_density = str(payload.get("UI_V2_DENSITY", previous_ui_v2_density))
+        previous_ui_v2_motion_profile = str(getattr(self, "ui_v2_motion_profile", "max"))
+        requested_ui_v2_motion_profile = str(payload.get("UI_V2_MOTION_PROFILE", previous_ui_v2_motion_profile))
+        previous_ui_v2_layout_profile = str(getattr(self, "ui_v2_layout_profile", "premium_glass_clinic"))
+        requested_ui_v2_layout_profile = str(payload.get("UI_V2_LAYOUT_PROFILE", previous_ui_v2_layout_profile))
+        previous_ui_v2_scale = int(getattr(self, "ui_v2_scale_percent", 100))
+        requested_ui_v2_scale = int(payload.get("UI_V2_SCALE_PERCENT", str(previous_ui_v2_scale)) or previous_ui_v2_scale)
 
         if apply_now:
             self._load_runtime_settings()
+            self._init_ui_v2_runtime()
             self._schedule_integration_jobs()
             self._refresh_ui_compact_toolbar_status()
             self.refresh_ai_status()
@@ -15345,9 +17055,22 @@ class PacientiAIApp:
             self.refresh_dashboard()
             if self._has_role("admin", "medic", "receptie"):
                 self.refresh_statistics()
-            if previous_ui_compact != requested_ui_compact:
+            ui_v2_requires_restart = (
+                previous_ui_v2_enabled != requested_ui_v2_enabled
+                or previous_ui_v2_theme != requested_ui_v2_theme
+                or previous_ui_v2_visual_style != requested_ui_v2_visual_style
+                or previous_ui_v2_chrome_mode != requested_ui_v2_chrome_mode
+                or previous_ui_v2_density != requested_ui_v2_density
+                or previous_ui_v2_motion_profile != requested_ui_v2_motion_profile
+                or previous_ui_v2_layout_profile != requested_ui_v2_layout_profile
+                or previous_ui_v2_scale != requested_ui_v2_scale
+            )
+            if previous_ui_compact != requested_ui_compact or ui_v2_requires_restart:
                 self.settings_hint_var.set(
-                    "Setari salvate si aplicate. Modificarea UI compact menus va fi vizibila complet dupa restart aplicatie."
+                    (
+                        "Setari salvate si aplicate. Modificarile de shell/tema UI (compact/V2) "
+                        "vor fi vizibile complet dupa restart aplicatie."
+                    )
                 )
             else:
                 self.settings_hint_var.set(
@@ -15534,8 +17257,8 @@ class PacientiAIApp:
         messagebox.showinfo("Setari", "Raportul ultimului import a fost sters.")
 
     def _build_audit_tab(self, parent: ttk.Frame) -> None:
-        frame = ttk.Frame(parent)
-        frame.pack(fill=BOTH, expand=True, padx=10, pady=10)
+        frame = self._make_scrollable_tab_container(parent, "audit")
+        frame.configure(padding=(10, 10, 10, 10))
 
         filters = ttk.LabelFrame(frame, text="Filtre audit")
         filters.pack(fill="x")
@@ -15576,6 +17299,12 @@ class PacientiAIApp:
                     ],
                 }
             ],
+        )
+        self._install_action_overflow(
+            parent=actions,
+            context_key="audit_actions",
+            primary_labels=["Filtreaza", "Curata"],
+            overflow_menu_label="More",
         )
         ttk.Label(
             filters,
@@ -16060,6 +17789,15 @@ class PacientiAIApp:
         self.refresh_dashboard()
 
     def _show_debounce_feedback(self, action_label: str, remaining_seconds: float) -> None:
+        if bool(getattr(self, "ui_v2_enabled", False)) and bool(getattr(self, "ui_v2_enable_toasts", True)):
+            remaining = max(0.1, float(remaining_seconds or 0.1))
+            remaining_text = f"{remaining:.2f}" if remaining < 1.0 else f"{remaining:.1f}"
+            self._show_toast(
+                f"{action_label}: asteapta ~{remaining_text}s inainte de urmatorul click.",
+                level="warning",
+                duration_ms=1800,
+            )
+            return
         if not hasattr(self, "root"):
             return
         remaining = max(0.1, float(remaining_seconds or 0.1))
@@ -17861,8 +19599,8 @@ class PacientiAIApp:
         messagebox.showinfo("Succes", "Parola a fost schimbata.")
 
     def _build_patient_tab(self, parent: ttk.Frame) -> None:
-        frame = ttk.Frame(parent)
-        frame.pack(fill=BOTH, expand=True, padx=10, pady=10)
+        frame = self._make_scrollable_tab_container(parent, "patient")
+        frame.configure(padding=(10, 10, 10, 10))
 
         self.patient_vars = {
             "first_name": tk.StringVar(),
@@ -18195,17 +19933,23 @@ class PacientiAIApp:
             context_key="patient_sheet_exports",
             menu_specs=[
                 {
-                    "menu_label": "Export pacient",
+                    "menu_label": "More",
                     "entries": [
                         {"label": "Export fisa PDF"},
                     ],
                 }
             ],
         )
+        self._install_action_overflow(
+            parent=actions,
+            context_key="patient_sheet_actions",
+            primary_labels=["Salveaza pacient"],
+            overflow_menu_label="More",
+        )
 
     def _build_patient_history_360_tab(self, parent: ttk.Frame) -> None:
-        frame = ttk.Frame(parent)
-        frame.pack(fill=BOTH, expand=True, padx=10, pady=10)
+        frame = self._make_scrollable_tab_container(parent, "patient_history")
+        frame.configure(padding=(10, 10, 10, 10))
 
         filters = ttk.LabelFrame(frame, text="Filtre timeline")
         filters.pack(fill="x", pady=(0, 8))
@@ -19575,8 +21319,8 @@ class PacientiAIApp:
         )
 
     def _build_visits_tab(self, parent: ttk.Frame) -> None:
-        frame = ttk.Frame(parent)
-        frame.pack(fill=BOTH, expand=True, padx=10, pady=10)
+        frame = self._make_scrollable_tab_container(parent, "visits")
+        frame.configure(padding=(10, 10, 10, 10))
 
         self.visit_vars = {
             "visit_date": tk.StringVar(value=datetime.now().strftime("%Y-%m-%d")),
@@ -19641,8 +21385,8 @@ class PacientiAIApp:
         ttk.Button(bottom, text="Sterge consultatia selectata", command=self.delete_selected_visit).pack(side=LEFT)
 
     def _build_admissions_tab(self, parent: ttk.Frame) -> None:
-        frame = ttk.Frame(parent)
-        frame.pack(fill=BOTH, expand=True, padx=10, pady=10)
+        frame = self._make_scrollable_tab_container(parent, "admissions")
+        frame.configure(padding=(10, 10, 10, 10))
 
         self.active_admission_var = tk.StringVar(value="Fara internare activa.")
         ttk.Label(frame, textvariable=self.active_admission_var, foreground="#0f766e").pack(anchor="w", pady=(0, 8))
@@ -20165,6 +21909,19 @@ class PacientiAIApp:
                     ],
                 },
             ],
+        )
+        self._install_action_overflow(
+            parent=discharge_actions,
+            context_key="admissions_discharge_export_fo",
+            primary_labels=[
+                "Externeaza internarea selectata",
+                "Valideaza caz",
+                "Finalizeaza caz",
+                "Checklist raportare",
+                "Handoff compact: ON",
+                "Handoff compact: OFF",
+            ],
+            overflow_menu_label="More",
         )
         self._apply_handoff_compact_mode()
 
@@ -20960,8 +22717,8 @@ class PacientiAIApp:
         reporting_wrap.grid_columnconfigure(5, weight=1)
 
     def _build_orders_tab(self, parent: ttk.Frame) -> None:
-        frame = ttk.Frame(parent)
-        frame.pack(fill=BOTH, expand=True, padx=10, pady=10)
+        frame = self._make_scrollable_tab_container(parent, "orders")
+        frame.configure(padding=(10, 10, 10, 10))
 
         form = ttk.LabelFrame(frame, text="Ordin medical nou")
         form.pack(fill="x")
@@ -21139,8 +22896,8 @@ class PacientiAIApp:
         medis_wrap.grid_columnconfigure(5, weight=1)
 
     def _build_vitals_tab(self, parent: ttk.Frame) -> None:
-        frame = ttk.Frame(parent)
-        frame.pack(fill=BOTH, expand=True, padx=10, pady=10)
+        frame = self._make_scrollable_tab_container(parent, "vitals")
+        frame.configure(padding=(10, 10, 10, 10))
 
         self.vital_vars = {
             "recorded_at": tk.StringVar(value=now_ts()),
@@ -21208,8 +22965,8 @@ class PacientiAIApp:
         self.vitals_tree.pack(fill=BOTH, expand=True, padx=6, pady=6)
 
     def _build_ai_tab(self, parent: ttk.Frame) -> None:
-        frame = ttk.Frame(parent)
-        frame.pack(fill=BOTH, expand=True, padx=10, pady=10)
+        frame = self._make_scrollable_tab_container(parent, "ai")
+        frame.configure(padding=(10, 10, 10, 10))
 
         self.ai_status_var = tk.StringVar()
         ttk.Label(frame, textvariable=self.ai_status_var, foreground="#1d4ed8").pack(anchor="w")
@@ -21228,21 +22985,40 @@ class PacientiAIApp:
         self.ai_prompt = ScrolledText(frame, height=6, wrap="word")
         self.ai_prompt.pack(fill="x")
 
-        actions = ttk.Frame(frame)
-        actions.pack(fill="x", pady=(8, 0))
-        self.send_btn = ttk.Button(actions, text="Trimite", command=self.send_ai_message)
-        self.send_btn.pack(side=LEFT)
-        self.summary_btn = ttk.Button(actions, text="Genereaza rezumat", command=self.generate_summary_prompt)
-        self.summary_btn.pack(side=LEFT, padx=8)
-        self.plan24_btn = ttk.Button(actions, text="Plan 24h", command=self.generate_plan_24h_prompt)
-        self.plan24_btn.pack(side=LEFT, padx=8)
-        self.discharge_btn = ttk.Button(actions, text="Draft externare", command=self.generate_discharge_draft_prompt)
-        self.discharge_btn.pack(side=LEFT, padx=8)
-        self.alert_explain_btn = ttk.Button(actions, text="Explica alerta", command=self.explain_latest_alert_prompt)
-        self.alert_explain_btn.pack(side=LEFT, padx=8)
-        ttk.Button(actions, text="Curata mesaj", command=lambda: self.ai_prompt.delete("1.0", END)).pack(side=LEFT)
+        actions = ActionBarV2(frame)
+        self.send_btn = actions.add_primary(text="Trimite", command=self.send_ai_message, style="Primary.TButton")
+        self.summary_btn = actions.add_primary(
+            text="Genereaza rezumat",
+            command=self.generate_summary_prompt,
+            padx=8,
+            style="Primary.TButton",
+        )
+        self.plan24_btn = actions.add_primary(
+            text="Plan 24h",
+            command=self.generate_plan_24h_prompt,
+            padx=8,
+            style="Secondary.TButton",
+        )
+        self.discharge_btn = actions.add_primary(
+            text="Draft externare",
+            command=self.generate_discharge_draft_prompt,
+            padx=8,
+            style="Secondary.TButton",
+        )
+        self.alert_explain_btn = actions.add_primary(
+            text="Explica alerta",
+            command=self.explain_latest_alert_prompt,
+            padx=8,
+            style="Secondary.TButton",
+        )
+        actions.add_primary(
+            text="Curata mesaj",
+            command=lambda: self.ai_prompt.delete("1.0", END),
+            padx=0,
+            style="Secondary.TButton",
+        )
         self._group_actions_into_menus(
-            parent=actions,
+            parent=actions.left,
             context_key="ai_assistant_actions",
             menu_specs=[
                 {
@@ -21255,6 +23031,13 @@ class PacientiAIApp:
                     ],
                 }
             ],
+            source_frames=[actions.left],
+        )
+        self._install_action_overflow(
+            parent=actions.left,
+            context_key="ai_assistant_actions",
+            primary_labels=["Trimite", "Genereaza rezumat"],
+            overflow_menu_label="More",
         )
 
         self.ai_template_key: Optional[str] = None
@@ -27005,6 +28788,166 @@ class PacientiAIApp:
                     f"central_ready={bool(checks.get('central_db_ready', False))}."
                 )
             )
+
+    def _read_db_mode_status_api_first(self) -> Dict[str, Any]:
+        if self._api_internal_ready_for_ops_read():
+            try:
+                return dict(self.enterprise_api_client.get_db_mode_status())
+            except Exception as exc:
+                self.enterprise_logger.warning("db mode status via api failed: %s", str(exc))
+        mode = (getattr(self, "api_internal_db_mode", "sqlite") or "sqlite").strip().lower() or "sqlite"
+        configured_backend = (getattr(self, "api_internal_db_backend", "sqlite") or "sqlite").strip().lower() or "sqlite"
+        if mode not in {"sqlite", "shadow", "postgres_primary"}:
+            mode = "sqlite"
+        effective_backend = "postgres" if mode == "postgres_primary" and configured_backend == "postgres" else "sqlite"
+        dsn_configured = bool((os.getenv("PACIENTI_POSTGRES_DSN") or "").strip())
+        central_db_ready = bool(mode != "postgres_primary") or dsn_configured
+        central_db_error = ""
+        if mode == "postgres_primary" and not dsn_configured:
+            central_db_error = "PACIENTI_POSTGRES_DSN lipseste."
+        return {
+            "timestamp": now_ts(),
+            "db_mode": mode,
+            "db_backend_configured": configured_backend,
+            "db_backend_effective": effective_backend,
+            "central_db_ready": bool(central_db_ready),
+            "central_db_error": central_db_error,
+            "shadow_enabled": bool(getattr(self, "api_internal_postgres_shadow_enabled", False)),
+            "postgres_primary_enabled": bool(getattr(self, "api_internal_postgres_primary_enabled", False)),
+            "postgres_require_tls": bool(getattr(self, "api_internal_postgres_require_tls", True)),
+            "offline_sync_enabled": bool(getattr(self, "api_internal_offline_sync_enabled", True)),
+            "offline_sync_batch_size": int(getattr(self, "api_internal_offline_sync_batch_size", 100) or 100),
+        }
+
+    def _read_reconciliation_status_api_first(self) -> Dict[str, Any]:
+        if self._api_internal_ready_for_ops_read():
+            try:
+                return dict(self.enterprise_api_client.get_reconciliation_status())
+            except Exception as exc:
+                self.enterprise_logger.warning("reconciliation status via api failed: %s", str(exc))
+        last_run_payload: Dict[str, Any] = {}
+        raw = str(self.db.get_setting("API_INTERNAL_RECONCILIATION_LAST_RESULT_JSON", "") or "").strip()
+        if raw:
+            try:
+                loaded = json.loads(raw)
+                if isinstance(loaded, dict):
+                    last_run_payload = loaded
+            except Exception:
+                last_run_payload = {}
+        return {
+            "timestamp": now_ts(),
+            "current": {"sqlite_authoritative": True, "message": "Status local (fara endpoint API)."},
+            "last_run": last_run_payload,
+        }
+
+    def _read_station_heartbeats_api_first(self, *, limit: int = 200, minutes: int = 15) -> List[Dict[str, Any]]:
+        lim = max(1, int(limit or 200))
+        mins = max(1, int(minutes or 15))
+        if self._api_internal_ready_for_ops_read():
+            try:
+                return [dict(row) for row in self.enterprise_api_client.list_stations_heartbeat(limit=lim, minutes=mins)]
+            except Exception as exc:
+                self.enterprise_logger.warning("stations heartbeat via api failed: %s", str(exc))
+        return [dict(row) for row in self.db.list_station_heartbeats(limit=lim, minutes=mins)]
+
+    def show_db_mode_status_popup(self) -> None:
+        if not self._require_role("Vezi status DB mode", "admin"):
+            return
+        status_payload = self._read_db_mode_status_api_first()
+        lines = [
+            f"DB mode: {status_payload.get('db_mode') or 'sqlite'}",
+            f"Backend configurat: {status_payload.get('db_backend_configured') or 'sqlite'}",
+            f"Backend efectiv: {status_payload.get('db_backend_effective') or 'sqlite'}",
+            f"Central DB ready: {bool(status_payload.get('central_db_ready', False))}",
+            f"Shadow enabled: {bool(status_payload.get('shadow_enabled', False))}",
+            f"Postgres primary enabled: {bool(status_payload.get('postgres_primary_enabled', False))}",
+            f"Postgres require TLS: {bool(status_payload.get('postgres_require_tls', True))}",
+            f"Offline sync enabled: {bool(status_payload.get('offline_sync_enabled', True))}",
+            f"Offline sync batch: {int(status_payload.get('offline_sync_batch_size') or 100)}",
+            f"Timestamp: {status_payload.get('timestamp') or '-'}",
+        ]
+        central_db_error = str(status_payload.get("central_db_error") or "").strip()
+        if central_db_error:
+            lines.append(f"Central DB error: {central_db_error}")
+        messagebox.showinfo("Status DB mode", "\n".join(lines))
+
+    def run_reconciliation_now(self) -> None:
+        if not self._require_role("Ruleaza reconciliere", "admin"):
+            return
+        if not self._api_internal_ready_for_ops_read():
+            messagebox.showwarning(
+                "Reconciliere",
+                "Endpoint-ul /api/v1/ops/reconciliation/run nu este disponibil (API intern indisponibil).",
+            )
+            return
+        try:
+            payload = dict(self.enterprise_api_client.run_reconciliation())
+        except Exception as exc:
+            messagebox.showerror("Reconciliere", f"Eroare la rularea reconcilierii:\n{exc}")
+            return
+        result = dict(payload.get("result") or {})
+        table_count = len(dict(result.get("tables") or {}))
+        self._audit(
+            "reconciliation_run_manual",
+            self._audit_details_from_pairs(("tables", table_count), ("ok", bool(payload.get("ok", False)))),
+        )
+        messagebox.showinfo(
+            "Reconciliere",
+            (
+                f"Rulare terminata.\n"
+                f"ok={bool(payload.get('ok', False))}\n"
+                f"postgres_shadow_ready={bool(result.get('postgres_shadow_ready', False))}\n"
+                f"tabele verificate={table_count}"
+            ),
+        )
+        if hasattr(self, "settings_hint_var"):
+            self.settings_hint_var.set(
+                f"Reconciliere rulata: ok={bool(payload.get('ok', False))}, tabele={table_count}."
+            )
+
+    def show_reconciliation_status_popup(self) -> None:
+        if not self._require_role("Vezi reconciliere", "admin"):
+            return
+        payload = self._read_reconciliation_status_api_first()
+        current = dict(payload.get("current") or {})
+        last_run = dict(payload.get("last_run") or {})
+        lines = [
+            f"Timestamp: {payload.get('timestamp') or '-'}",
+            f"Postgres shadow ready (curent): {bool(current.get('postgres_shadow_ready', False))}",
+            f"SQLite authoritative: {bool(current.get('sqlite_authoritative', True))}",
+        ]
+        current_tables = dict(current.get("tables") or {})
+        if current_tables:
+            lines.append("Tabele (curent):")
+            for name, item in sorted(current_tables.items()):
+                row = dict(item or {})
+                lines.append(
+                    f" - {name}: count_match={bool(row.get('count_match', False))}, "
+                    f"row_version_match={bool(row.get('row_version_match', False))}"
+                )
+        if last_run:
+            lines.append(f"Ultima rulare: {last_run.get('timestamp') or '-'}")
+            lines.append(f"Postgres ready (ultima): {bool(last_run.get('postgres_shadow_ready', False))}")
+        else:
+            lines.append("Ultima rulare: nu exista.")
+        messagebox.showinfo("Status reconciliere", "\n".join(lines))
+
+    def show_station_heartbeats_popup(self) -> None:
+        if not self._require_role("Heartbeat statii", "admin"):
+            return
+        rows = self._read_station_heartbeats_api_first(limit=200, minutes=30)
+        if not rows:
+            messagebox.showinfo("Heartbeat statii", "Nu exista heartbeat-uri recente.")
+            return
+        lines: List[str] = []
+        for item in rows[:80]:
+            row = dict(item)
+            lines.append(
+                f"{row.get('last_seen_at') or '-'} | {row.get('client_name') or '-'} | "
+                f"user={row.get('actor_name') or '-'} ({row.get('user_role') or '-'}) | "
+                f"ip={row.get('ip_address') or '-'} | {row.get('status') or 'online'}"
+            )
+        messagebox.showinfo("Heartbeat statii", "\n".join(lines))
 
     def _build_shadow_backend(self) -> PostgresShadowBackend:
         return PostgresShadowBackend(
